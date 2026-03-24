@@ -12,13 +12,40 @@ namespace MeatKit
 {
     public partial class MeatKit
     {
+        // Guards against re-entrant builds.
+        internal static bool _buildRunning = false;
+
         public static void DoBuild()
         {
+            if (_buildRunning)
+            {
+                Debug.LogWarning("[MeatKit] DoBuild called while a build is already running — ignoring.");
+                return;
+            }
+
+            // Refuse to start a build while scripts are still being compiled
+            if (EditorApplication.isCompiling)
+            {
+                EditorUtility.DisplayDialog("Cannot build",
+                    "Scripts are currently being compiled. Please wait for compilation to finish and then try again.",
+                    "Ok");
+                return;
+            }
+
+            // Lock assembly reloads for the duration of the build to prevent a crash on subsequent builds
+            _buildRunning = true;
+            EditorApplication.LockReloadAssemblies();
+
             BuildLog.StartNew();
-            
             try
             {
                 DoBuildInternal();
+            }
+            catch (System.Threading.ThreadAbortException)
+            {
+                System.Threading.Thread.ResetAbort();
+                BuildLog.SetCompletionStatus(true, "Build interrupted by domain reload.", null);
+                Debug.LogWarning("[MeatKit] Build was interrupted by a domain reload. Please try again.");
             }
             catch (MeatKitBuildException e)
             {
@@ -35,8 +62,21 @@ namespace MeatKit
                 Debug.LogException(e);
                 BuildLog.SetCompletionStatus(true, "Unexpected exception during build", e);
             }
-            
-            BuildLog.Finish();
+            finally
+            {
+                _buildRunning = false;
+                try { BuildLog.Finish(); }
+                catch (System.Threading.ThreadAbortException) { System.Threading.Thread.ResetAbort(); }
+                catch (Exception) { }
+                // Defer the unlock to the next editor frame so the domain reload fires with a clean call stack
+                EditorApplication.delayCall += UnlockReloadDelayed;
+            }
+        }
+
+        // Deferred unlock so the domain reload fires on a clean call stack
+        private static void UnlockReloadDelayed()
+        {
+            EditorApplication.UnlockReloadAssemblies();
         }
 
         private static void DoBuildInternal()
@@ -71,7 +111,7 @@ namespace MeatKit
             BuildLog.WriteLine("Forcing VR support on");
             bool wasVirtualRealitySupported = PlayerSettings.virtualRealitySupported;
             PlayerSettings.virtualRealitySupported = true;
-            
+
             // Create a map of assembly names to what we want to rename them to, then enable bundle processing
             var replaceMap = new Dictionary<string, string>
             {
@@ -98,7 +138,6 @@ namespace MeatKit
             for (var i = 0; i < bundles.Length; i++)
             {
                 var originalName = bundles[i].assetBundleName;
-                
                 // Needed to prevent runtime conflicts. 2 bundles with the same internal (build-time) name
                 // cannot be loaded simultaneously by Unity. Apply lowercase, since names passed to BuildPipeline
                 // are also lowercased.
@@ -106,19 +145,27 @@ namespace MeatKit
                 if (bundleNameMap.ContainsKey(buildTimeName))
                     throw new MeatKitBuildException("Two or more AssetBundles share the same name - this is not " +
                                                     "supported. Make sure all your AssetBundles have unique names.");
-                
                 bundleNameMap[buildTimeName] = originalName;
                 bundles[i].assetBundleName = buildTimeName;
             }
 
             BuildLog.WriteLine(bundles.Length + " bundles to build. Building bundles.");
-            BuildPipeline.BuildAssetBundles(bundleOutputPath, bundles, BuildAssetBundleOptions.ChunkBasedCompression,
-                BuildTarget.StandaloneWindows64);
-            
+
+            // Refresh per-GUID TypeTree cache so OrigMonoScriptTransferWrite writes correct
+            // FVRObject field layouts. Without this the Transfer hook's temporary assembly rename
+            // causes a stale-cache fallback that writes empty TypeTrees (items don't spawn).
+            ManagedPluginDomainFix.PrimeTypeTreesForBuild();
+
+            var bundleManifest = BuildPipeline.BuildAssetBundles(bundleOutputPath, bundles,
+                BuildAssetBundleOptions.ChunkBasedCompression, BuildTarget.StandaloneWindows64);
+
+            if (bundleManifest == null)
+                throw new MeatKitBuildException("AssetBundle build failed to produce a manifest. Check the console for errors.");
+
             // Disable bundle processing now that we're done with it.
             AssetBundleIO.DisableProcessing();
             BuildLog.WriteLine("Bundles built");
-            
+
             // Cleanup the unused files created with building the bundles
             BuildLog.WriteLine("Cleaning unused files");
             foreach (var file in Directory.GetFiles(bundleOutputPath, "*.manifest"))
@@ -137,7 +184,6 @@ namespace MeatKit
                                                     "console/build items for errors. Make sure your bundle names " +
                                                     "don't contain any illegal characters. " +
                                                     "Name of bundle that failed: " + entry.Value);
-
                 File.Move(buildTimeNamePath, originalNamePath);
             }
 
@@ -148,6 +194,7 @@ namespace MeatKit
             BuildLog.WriteLine("Exporting editor assembly");
             var requiredScripts = AssetBundleIO.SerializedScriptNames;
             ExportEditorAssembly(bundleOutputPath, tempAssemblyFile, requiredScripts);
+            File.Delete(tempAssemblyFile);
 
             // Now we can write the Thunderstore stuff to the folder
             BuildLog.WriteLine("Writing Thunderstore manifest");
@@ -177,7 +224,6 @@ namespace MeatKit
             // Write the texture to file
             BuildLog.WriteLine("Saving icon");
             File.WriteAllBytes(bundleOutputPath + "icon.png", icon.EncodeToPNG());
-
             // Copy the readme
             BuildLog.WriteLine("Copying readme");
             var readmePath = bundleOutputPath + "README.md";
@@ -202,18 +248,24 @@ namespace MeatKit
                 Directory.CreateDirectory(pluginFolder);
                 Extensions.CopyFilesRecursively(bundleOutputPath, pluginFolder);
             }
-            else if (profile.BuildAction == BuildAction.CreateThunderstorePackage)
+
+            if (profile.BuildAction == BuildAction.CreateThunderstorePackage)
             {
                 BuildLog.WriteLine("Zipping built files");
-                using (var zip = new ZipFile())
+                var zipPath = Path.Combine(bundleOutputPath, packageName + "-" + profile.Version + ".zip");
+                var zip = new ZipFile();
+                try
                 {
                     zip.AddDirectory(bundleOutputPath, "");
-                    var zipPath = Path.Combine(bundleOutputPath, packageName + "-" + profile.Version + ".zip");
                     zip.Save(zipPath);
-                    
-                    if (File.Exists(zipPath))
-                        EditorUtility.RevealInFinder(zipPath);
                 }
+                finally
+                {
+                    zip.Dispose();
+                }
+
+                if (File.Exists(zipPath))
+                    EditorUtility.RevealInFinder(zipPath);
             }
             else
             {
@@ -221,6 +273,8 @@ namespace MeatKit
                 if (File.Exists(readmePath))
                     EditorUtility.RevealInFinder(readmePath);
             }
+
+            ManagedPluginDomainFix.RepairNow();
 
             // End the stopwatch and save the time
             BuildLog.SetCompletionStatus(false, "", null);
@@ -234,5 +288,8 @@ namespace MeatKit
             if (Directory.Exists(outputPath)) Directory.Delete(outputPath, true);
             Directory.CreateDirectory(outputPath);
         }
+
+
+
     }
 }

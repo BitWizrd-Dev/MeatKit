@@ -55,6 +55,15 @@ namespace MeatKit
         /// </summary>
         private static void OnMonoScriptTransferWrite(IntPtr monoScript, IntPtr streamedBinaryWrite)
         {
+            // Guard against null/freed pointers that Unity may pass during cancel-cleanup passes.
+            // A cancelled BuildAssetBundles pass can invoke the hook with monoScript == 0 or with
+            // a pointer into already-freed memory; reading from it would be an access violation.
+            if (monoScript == IntPtr.Zero)
+            {
+                OrigMonoScriptTransferWrite(monoScript, streamedBinaryWrite);
+                return;
+            }
+
             // If processing is disabled just run the original and skip.
             if (!ProcessingEnabledWrite)
             {
