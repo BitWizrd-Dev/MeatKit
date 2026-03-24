@@ -58,6 +58,9 @@ namespace MeatKit
                 // Publicize Assembly
                 AssemblyStripper.MakePublic(firstpassAssembly, new string[0], false, false);
 
+                // Remove any methods that reference UnityEditor APIs to avoid editor-only references
+                RemoveEditorOnlyMethodReferences(firstpassAssembly);
+
                 firstpassAssembly.Write(Path.Combine(destinationDirectory, AssemblyFirstpassRename + ".dll"));
                 firstpassAssembly.Dispose();
             }
@@ -76,10 +79,24 @@ namespace MeatKit
                     .Name = AssemblyFirstpassRename;
 
                 // Strip some types from the assembly to prevent doubles in the editor
-                foreach (var typename in StripAssemblyTypes)
+                // Use the safe stripper to remove dependents first and validate integrity.
+                try
                 {
-                    var type = mainAssembly.MainModule.GetType(typename);
-                    if (type != null) mainAssembly.MainModule.Types.Remove(type);
+                    var stripResult = SafeAssemblyStripper.StripTypesSafely(mainAssembly, StripAssemblyTypes);
+                    if (stripResult != null && stripResult.Errors.Count > 0)
+                    {
+                        foreach (var err in stripResult.Errors) Debug.LogWarning("SafeAssemblyStripper: " + err);
+                    }
+                }
+                catch (System.Exception ex)
+                {
+                    Debug.LogError("SafeAssemblyStripper failed: " + ex.Message);
+                    // Fallback: attempt original naive removal to avoid blocking import
+                    foreach (var typename in StripAssemblyTypes)
+                    {
+                        var type = mainAssembly.MainModule.GetType(typename);
+                        if (type != null) mainAssembly.MainModule.Types.Remove(type);
+                    }
                 }
 
                 // Apply modifications
@@ -94,6 +111,9 @@ namespace MeatKit
                 //  Make Alloy.EnumExtension internal and rename it to something else to prevent a conflict.
                 TypeDefinition alloyEnumExtension = mainAssembly.MainModule.GetType("Alloy.EnumExtension");
                 alloyEnumExtension.IsPublic = false;
+
+                // Remove any methods that reference UnityEditor APIs to avoid editor-only references
+                RemoveEditorOnlyMethodReferences(mainAssembly);
 
                 // Write the main assembly out into the destination folder and dispose it
                 mainAssembly.Write(Path.Combine(destinationDirectory, AssemblyRename + ".dll"));
@@ -115,6 +135,69 @@ namespace MeatKit
             // When we're done importing assemblies, let Unity refresh the asset database
             PlayerSettings.SetScriptingDefineSymbolsForGroup(BuildTargetGroup.Standalone, "H3VR_IMPORTED");
             NormalizeMetaFileGUIDs();
+        }
+
+        private static void RemoveEditorOnlyMethodReferences(AssemblyDefinition asm)
+        {
+            var methodsToRemove = new System.Collections.Generic.List<MethodDefinition>();
+
+            foreach (var type in asm.MainModule.Types)
+            {
+                foreach (var method in type.Methods.ToList())
+                {
+                    bool remove = false;
+
+                    // Check method custom attributes
+                    foreach (var ca in method.CustomAttributes)
+                    {
+                        var asmRef = ca.AttributeType.Scope as AssemblyNameReference;
+                        if (asmRef != null && asmRef.Name == "UnityEditor")
+                        {
+                            remove = true;
+                            break;
+                        }
+                    }
+
+                    if (remove)
+                    {
+                        methodsToRemove.Add(method);
+                        continue;
+                    }
+
+                    if (!method.HasBody) continue;
+
+                    foreach (var instr in method.Body.Instructions)
+                    {
+                        var memRef = instr.Operand as MemberReference;
+                        if (memRef == null) continue;
+
+                        IMetadataScope scope = null;
+                        var typeRef = memRef as TypeReference;
+                        if (typeRef != null) scope = typeRef.Scope;
+                        else if (memRef.DeclaringType != null) scope = memRef.DeclaringType.Scope;
+
+                        var asmRef2 = scope as AssemblyNameReference;
+                        if (asmRef2 != null && asmRef2.Name == "UnityEditor")
+                        {
+                            methodsToRemove.Add(method);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            foreach (var m in methodsToRemove)
+            {
+                try
+                {
+                    m.DeclaringType.Methods.Remove(m);
+                    Debug.Log("Removed editor-only method during import: " + m.FullName);
+                }
+                catch
+                {
+                    // swallow - removal is best-effort
+                }
+            }
         }
 
         private static void ImportSingleAssembly(string assemblyPath, string destinationDirectory)
@@ -228,6 +311,21 @@ namespace MeatKit
             public RedirectedAssemblyResolver(params string[] redirectPath)
             {
                 _redirectPaths = redirectPath;
+                // Ensure the default resolver knows about our redirect search paths so it can
+                // resolve assemblies by identity (not just filename). This lets it find
+                // UnityEngine (and core modules) even when the physical DLL filename
+                // doesn't match the simple assembly name.
+                foreach (var p in _redirectPaths)
+                {
+                    try
+                    {
+                        _defaultResolver.AddSearchDirectory(p);
+                    }
+                    catch
+                    {
+                        // Ignore any issues adding search directories; fallback logic will still try file names.
+                    }
+                }
             }
 
             public override AssemblyDefinition Resolve(AssemblyNameReference name)
