@@ -61,7 +61,7 @@ namespace MeatKit
                 // Remove any methods that reference UnityEditor APIs to avoid editor-only references
                 RemoveEditorOnlyMethodReferences(firstpassAssembly);
 
-                firstpassAssembly.Write(Path.Combine(destinationDirectory, AssemblyFirstpassRename + ".dll"));
+                WriteSafely(firstpassAssembly, Path.Combine(destinationDirectory, AssemblyFirstpassRename + ".dll"));
                 firstpassAssembly.Dispose();
             }
 
@@ -116,7 +116,7 @@ namespace MeatKit
                 RemoveEditorOnlyMethodReferences(mainAssembly);
 
                 // Write the main assembly out into the destination folder and dispose it
-                mainAssembly.Write(Path.Combine(destinationDirectory, AssemblyRename + ".dll"));
+                WriteSafely(mainAssembly, Path.Combine(destinationDirectory, AssemblyRename + ".dll"));
             }
 
             // Then lastly copy the other assemblies to the destination folder
@@ -135,6 +135,35 @@ namespace MeatKit
             // When we're done importing assemblies, let Unity refresh the asset database
             PlayerSettings.SetScriptingDefineSymbolsForGroup(BuildTargetGroup.Standalone, "H3VR_IMPORTED");
             NormalizeMetaFileGUIDs();
+        }
+
+        // Attempts to write the Cecil assembly directly to destPath.  If the destination is
+        // locked (Unity's child domain has the DLL memory-mapped), stages the output in
+        // Library/PendingDllImports/ and temporarily disables the plugin so the next domain
+        // reload releases the lock.  ManagedPluginDomainFix.ApplyPendingDllImports() finishes
+        // the copy once the domain reload has freed the file handle.
+        private static void WriteSafely(AssemblyDefinition assembly, string destPath)
+        {
+            try
+            {
+                assembly.Write(destPath);
+                return;
+            }
+            catch (IOException)
+            {
+                // Fall through to staging path.
+            }
+
+            string pendingDir = Path.GetFullPath(
+                Path.Combine(Path.Combine(Path.Combine(Application.dataPath, ".."), "Library"), "PendingDllImports"));
+            if (!Directory.Exists(pendingDir))
+                Directory.CreateDirectory(pendingDir);
+
+            string pendingPath = Path.Combine(pendingDir, Path.GetFileName(destPath));
+            assembly.Write(pendingPath);
+
+            ManagedPluginDomainFix.StageForPendingImport(pendingPath, destPath);
+            Debug.Log("[MeatKit] DLL locked by Unity domain; staged to " + pendingPath + ". Will apply after domain reload.");
         }
 
         private static void RemoveEditorOnlyMethodReferences(AssemblyDefinition asm)
@@ -310,22 +339,22 @@ namespace MeatKit
 
             public RedirectedAssemblyResolver(params string[] redirectPath)
             {
-                _redirectPaths = redirectPath;
-                // Ensure the default resolver knows about our redirect search paths so it can
-                // resolve assemblies by identity (not just filename). This lets it find
-                // UnityEngine (and core modules) even when the physical DLL filename
-                // doesn't match the simple assembly name.
-                foreach (var p in _redirectPaths)
-                {
-                    try
+                    _redirectPaths = redirectPath;
+                    // Ensure the default resolver knows about our redirect search paths so it can
+                    // resolve assemblies by identity (not just filename). This lets it find
+                    // UnityEngine (and core modules) even when the physical DLL filename
+                    // doesn't match the simple assembly name.
+                    foreach (var p in _redirectPaths)
                     {
-                        _defaultResolver.AddSearchDirectory(p);
+                        try
+                        {
+                            _defaultResolver.AddSearchDirectory(p);
+                        }
+                        catch
+                        {
+                            // Ignore any issues adding search directories; fallback logic will still try file names.
+                        }
                     }
-                    catch
-                    {
-                        // Ignore any issues adding search directories; fallback logic will still try file names.
-                    }
-                }
             }
 
             public override AssemblyDefinition Resolve(AssemblyNameReference name)

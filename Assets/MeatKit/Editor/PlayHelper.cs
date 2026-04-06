@@ -1,17 +1,14 @@
 using System;
+using System.Collections.Generic;
 using System.Reflection;
 using HarmonyLib;
 using UnityEngine;
 
-// Bootstraps the minimum FistVR manager singletons needed for FVRPhysicalObject and
-// FVRFireArm to initialise in editor play mode.  All types are resolved from
-// H3VRCode-CSharp so the correct ManagerSingleton tables are used.  C# 4.0 only.
+// Bootstraps the minimum FistVR manager singletons needed for items to initialise in
+// editor play mode.  All types resolved from H3VRCode-CSharp at runtime. 
 public static class PlayHelper
 {
 #if UNITY_EDITOR
-
-    // Set to true to print verbose bootstrap messages to the console.
-    private const bool VerboseLogs = false;
 
     // -------------------------------------------------------------------------
     // Modder opt-out toggle
@@ -45,7 +42,154 @@ public static class PlayHelper
     // Harmony prefix — returning false skips the patched method entirely.
     private static bool SkipMethod() { return false; }
 
-    private static void Log(string msg) { if (VerboseLogs) Debug.Log("[PlayHelper] " + msg); }
+    // Harmony Finalizer — swallows any exception thrown by the patched method.
+    private static Exception SwallowException(Exception __exception) { return null; }
+
+    // =========================================================================
+    // RECURSIVE NULL-HEALER
+    // =========================================================================
+    // Harmony Prefix on FVRPhysicalObject.Awake.  Fires on the actual derived type
+    // and heals null [Serializable] fields, arrays, and List<T>s that are stripped
+    // after a MeatKit build.  UnityEngine.Object refs and [NonSerialized] fields
+    // are never touched.  Type-level caching amortises the reflection walk.
+    // =========================================================================
+
+    private const int HealMaxDepth = 6;
+
+    // Per-type cache of healable fields; built once per type, reused each Awake.
+    private static readonly Dictionary<Type, FieldInfo[]> _healCache
+        = new Dictionary<Type, FieldInfo[]>();
+    private static readonly object _healCacheLock = new object();
+
+    // Harmony Prefix entry-point — __instance is the full derived object.
+    private static void HealSerializedNulls(object __instance)
+    {
+        if (__instance == null) return;
+        HealObject(__instance, 0);
+    }
+
+    // Walk own type + every base type up to (but not including) MonoBehaviour.
+    private static void HealObject(object obj, int depth)
+    {
+        if (obj == null || depth >= HealMaxDepth) return;
+        Type t = obj.GetType();
+        while (t != null
+               && t != typeof(MonoBehaviour)
+               && t != typeof(Behaviour)
+               && t != typeof(Component)
+               && t != typeof(UnityEngine.Object)
+               && t != typeof(object))
+        {
+            HealFields(obj, t, depth);
+            t = t.BaseType;
+        }
+    }
+
+    private static void HealFields(object obj, Type declaredType, int depth)
+    {
+        FieldInfo[] fields = GetHealableFields(declaredType);
+        for (int i = 0; i < fields.Length; i++)
+        {
+            FieldInfo f = fields[i];
+            Type ft     = f.FieldType;
+            object val  = f.GetValue(obj);
+
+            if (ft.IsArray)
+            {
+                if (val == null)
+                {
+                    // Empty array satisfies any .Length check.
+                    f.SetValue(obj, Array.CreateInstance(ft.GetElementType(), 0));
+                }
+                else if (depth + 1 < HealMaxDepth)
+                {
+                    // Recurse into populated arrays of healable elements.
+                    Type et = ft.GetElementType();
+                    if (IsHealableInlineType(et))
+                    {
+                        Array arr = (Array)val;
+                        for (int ai = 0; ai < arr.Length; ai++)
+                        {
+                            object elem = arr.GetValue(ai);
+                            if (elem == null)
+                            {
+                                try { elem = Activator.CreateInstance(et); arr.SetValue(elem, ai); }
+                                catch { continue; }
+                            }
+                            if (elem != null) HealObject(elem, depth + 1);
+                        }
+                    }
+                }
+            }
+            else if (IsSerializedListType(ft))
+            {
+                // Ensure the List itself is non-null; elements are runtime data.
+                if (val == null)
+                {
+                    try { f.SetValue(obj, Activator.CreateInstance(ft)); }
+                    catch { /* ignore if List<T> ctor fails */ }
+                }
+            }
+            else if (IsHealableInlineType(ft))
+            {
+                if (val == null)
+                {
+                    try { val = Activator.CreateInstance(ft); f.SetValue(obj, val); }
+                    catch { val = null; }
+                }
+                if (val != null) HealObject(val, depth + 1);
+            }
+        }
+    }
+
+    // Returns cached list of fields on this declaring type that require healing.
+    private static FieldInfo[] GetHealableFields(Type t)
+    {
+        FieldInfo[] cached;
+        lock (_healCacheLock)
+        {
+            if (_healCache.TryGetValue(t, out cached)) return cached;
+        }
+
+        FieldInfo[] all = t.GetFields(
+            BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly);
+        List<FieldInfo> result = new List<FieldInfo>();
+        for (int i = 0; i < all.Length; i++)
+        {
+            FieldInfo f = all[i];
+            if (f.IsDefined(typeof(NonSerializedAttribute), false)) continue;
+            Type ft = f.FieldType;
+            if (ft.IsArray || IsSerializedListType(ft) || IsHealableInlineType(ft))
+                result.Add(f);
+        }
+
+        cached = result.ToArray();
+        lock (_healCacheLock) { _healCache[t] = cached; }
+        return cached;
+    }
+
+    // True for a [Serializable] concrete class that Activator.CreateInstance can build.
+    private static bool IsHealableInlineType(Type t)
+    {
+        if (t == null || t.IsValueType || t == typeof(string)) return false;
+        if (t.IsAbstract || t.IsInterface || t.IsGenericType) return false;
+        if (typeof(UnityEngine.Object).IsAssignableFrom(t)) return false;
+        return t.IsDefined(typeof(SerializableAttribute), false);
+    }
+
+    // True for any closed List<T> — Unity serialises these as variable-length arrays.
+    private static bool IsSerializedListType(Type t)
+    {
+        return t.IsGenericType
+            && t.GetGenericTypeDefinition() == typeof(List<>);
+    }
+
+    private static void Log(string msg) { }
+
+    private static void Warn(string msg)
+    {
+        Debug.LogWarning("[PlayHelper] " + msg);
+    }
 
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
     private static void OnBeforeSceneLoad()
@@ -64,13 +208,11 @@ public static class PlayHelper
             return;
         }
 
-        // Patch crashing methods before AddComponent fires — Unity swallows Awake exceptions
-        // internally so our try/catch never sees them.  Patches stay alive for the session.
+        // Patch crashing methods before AddComponent fires; patches stay alive for the session.
         _harmony = new Harmony("com.bitwizrd.playhelper.editorsafety");
         ApplyInitPatches(gmType, ssType, amType, smType, fxmType);
 
         // GM first — FVRSceneSettings.Awake needs IsAsyncLoading already set.
-        // Awake is no-op'd (9 cascading ES2 crashes), so Instance is set manually.
         GameObject gmGO = CreateEditorManager(gmType, "[Editor GM]");
         if (gmGO != null) SetManagerSingletonInstance(gmType, gmGO);
 
@@ -94,7 +236,7 @@ public static class PlayHelper
             PopulateAMAccuracyDictionary(amType);
         }
 
-        // SM — audio pool dicts seeded manually; Awake no-op'd, Instance set manually.
+        // SM — audio pool dicts seeded manually.
         if (smType != null)
         {
             GameObject smGO = CreateEditorManager(smType, "[Editor SM]");
@@ -104,8 +246,7 @@ public static class PlayHelper
             SeedSMImpactDictionary(smType);
         }
 
-        // FXM — muzzle dict seeded with dummy configs; Awake no-op'd, Instance set manually.
-        // Component disabled to prevent Update() NullRef on the null MuzzleFireLight.
+        // FXM — muzzle dict seeded with dummy configs; component disabled to prevent Update NPE.
         if (fxmType != null)
         {
             GameObject fxmGO = CreateEditorManager(fxmType, "[Editor FXM]");
@@ -120,16 +261,8 @@ public static class PlayHelper
         Log("Harmony patches active, all managers bootstrapped.");
     }
 
-    // Disables all existing scene cameras and spawns [EditorVRCamera] at the SceneView
-    // eye position so the VR headset has a sensible render origin.
-    //
-    // The SceneView camera is explicitly disconnected from VR stereo rendering
-    // (stereoTargetEye = None) so mouse/keyboard scene navigation remains independent
-    // from what the HMD is doing.  In Unity 5.6 editor VR mode, the scene view camera
-    // is by default also driven by HMD pose data; opting it out here means the two
-    // cameras are fully independent:
-    //   [EditorVRCamera]  — rendered to the HMD; position driven by the VR SDK
-    //   SceneView camera  — navigated with mouse/keyboard as usual in edit mode
+    // Spawns [EditorVRCamera] at the SceneView eye position for HMD rendering and
+    // disconnects the scene-view camera from VR stereo so scene navigation works normally.
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     private static void OnAfterSceneLoad()
     {
@@ -142,9 +275,7 @@ public static class PlayHelper
             Log("Disabled existing camera: " + existing[i].gameObject.name);
         }
 
-        // Read scene-view position BEFORE creating the VR camera so the spawn point
-        // is where the user was looking from, then immediately detach the scene-view
-        // camera from VR tracking.
+        // Capture scene-view position, then detach the scene-view camera from VR tracking.
         Vector3 spawnPos;
         Quaternion spawnRot;
         UnityEditor.SceneView sv = UnityEditor.SceneView.lastActiveSceneView;
@@ -188,12 +319,10 @@ public static class PlayHelper
         {
             UnityEditor.EditorApplication.update -= KeepSceneViewDetachedFromVR;
             UnityEditor.EditorApplication.playmodeStateChanged -= OnPlaymodeChanged;
-            Log("Play mode ended – SceneView VR-detach guard removed.");
         }
     }
 
-    // Called every editor frame while in play mode.  If the VR system re-enabled stereo
-    // on the scene-view camera, revert it so the scene view stays free for navigation.
+    // Reverts stereo eye if the VR system re-enables it on the scene-view camera each frame.
     private static void KeepSceneViewDetachedFromVR()
     {
         UnityEditor.SceneView sv = UnityEditor.SceneView.lastActiveSceneView;
@@ -205,8 +334,32 @@ public static class PlayHelper
         }
     }
 
-    // No-ops all Awake/Start/Update methods that crash due to missing editor resources.
-    // Patches stay alive for the session; AppDomain resets on play-stop.
+    // Patches Awake with a Finalizer so base.Awake() runs (setting Instance) and
+    // any subsequent exceptions in the body are swallowed.
+    private static void PatchAwakeWithSwallow(Type managerType)
+    {
+        try
+        {
+            MethodInfo awake = AccessTools.Method(managerType, "Awake");
+            if (awake == null)
+            {
+                Warn("PatchAwakeWithSwallow: Awake not found on " + managerType.Name);
+                return;
+            }
+            HarmonyMethod swallow = new HarmonyMethod(
+                typeof(PlayHelper).GetMethod("SwallowException",
+                    BindingFlags.Static | BindingFlags.NonPublic));
+            _harmony.Patch(awake, finalizer: swallow);
+            Log("Finalizer-patched " + managerType.Name + ".Awake (base.Awake sets Instance; exceptions suppressed).");
+        }
+        catch (Exception ex)
+        {
+            Warn("PatchAwakeWithSwallow failed for "
+                + managerType.Name + ": " + ex.Message);
+        }
+    }
+
+    // No-ops or Finalizer-patches methods that crash due to missing editor resources.
     private static void ApplyInitPatches(
         Type gmType, Type ssType, Type amType, Type smType, Type fxmType)
     {
@@ -218,8 +371,11 @@ public static class PlayHelper
 
             if (gmType != null)
             {
-                PatchSafely(AccessTools.Method(gmType, "Awake"), skip);
+                // GM.Start requires Steam; suppress it.
                 PatchSafely(AccessTools.Method(gmType, "Start"), skip);
+
+                // Swallow ES2 save-data exceptions that fire before managed catch can intercept.
+                PatchAwakeWithSwallow(gmType);
             }
 
             if (ssType != null)
@@ -233,13 +389,17 @@ public static class PlayHelper
                 PatchSafely(AccessTools.Method(amType, "GenerateFireArmRoundDictionaries"), skip);
 
             if (smType != null)
-                PatchSafely(AccessTools.Method(smType, "Awake"), skip);
+                PatchAwakeWithSwallow(smType);
 
             if (fxmType != null)
-                PatchSafely(AccessTools.Method(fxmType, "Awake"), skip);
+                PatchAwakeWithSwallow(fxmType);
 
             if (smType != null)
+            {
                 PatchSafely(AccessTools.Method(smType, "SetReverbEnvironment"), skip);
+                // SM.Update NPEs on null TinnitusSound; no-op it.
+                PatchSafely(AccessTools.Method(smType, "Update"), skip);
+            }
 
             if (ssType != null)
             {
@@ -247,31 +407,79 @@ public static class PlayHelper
                 PatchSafely(AccessTools.Method(ssType, "Update"), skip);
             }
 
-            // PlayImpactSound calls GM.CurrentPlayerBody.Head (null in editor) before any dict lookup.
+            // CurrentPlayerBody is null in editor.
             Type aicType = ResolveFromH3VR("FistVR.AudioImpactController");
             if (aicType != null)
                 PatchSafely(AccessTools.Method(aicType, "OnCollisionEnter"), skip);
 
-            // Winchester1873LoadingGate.Update reads GM.CurrentMovementManager via a property
-            // getter that NullRefs when ManagerSingleton<GM>.Instance is null.  No-op the Update
-            // loop so the guard check inside can never execute the crashing property access.
+            // Reads GM.CurrentMovementManager which is null in editor.
             Type w1873Type = ResolveFromH3VR("FistVR.Winchester1873LoadingGate");
             if (w1873Type != null)
                 PatchSafely(AccessTools.Method(w1873Type, "Update"), skip);
 
-            // ForceTubeVRInterface.OnLoadRuntimeMethod calls DllImport'd ForceTubeVR_API_x64,
-            // which throws DllNotFoundException and stops all physics in the editor.
-            // No-op it so play mode works without the haptic feedback DLL installed.
+            // DllNotFoundException from haptic feedback DLL; no-op if not installed.
             Type forceTubeType = ResolveFromH3VR("ForceTubeVRInterface");
             if (forceTubeType != null)
             {
                 PatchSafely(AccessTools.Method(forceTubeType, "OnLoadRuntimeMethod"), skip);
                 PatchSafely(AccessTools.Method(forceTubeType, "InitAsync"), skip);
             }
+
+            // PlayAudioEvent requires CurrentPlayerBody which is null in editor.
+            Type fireArmType = ResolveFromH3VR("FistVR.FVRFireArm");
+            if (fireArmType != null)
+            {
+                Type eType = ResolveFromH3VR("FistVR.FirearmAudioEventType");
+                if (eType != null)
+                    PatchSafely(AccessTools.Method(fireArmType, "PlayAudioEvent",
+                        new Type[] { eType, typeof(float) }), skip);
+
+                // Serialized effect arrays stripped by MeatKit build; swallow the Awake crash.
+                PatchAwakeWithSwallow(fireArmType);
+            }
+
+            // Attach the recursive null-healer to FVRPhysicalObject.Awake.
+            Type fpoType = ResolveFromH3VR("FistVR.FVRPhysicalObject");
+            if (fpoType != null)
+            {
+                MethodInfo fpoAwake = AccessTools.Method(fpoType, "Awake");
+                if (fpoAwake != null)
+                {
+                    HarmonyMethod healPrefix = new HarmonyMethod(
+                        typeof(PlayHelper).GetMethod("HealSerializedNulls",
+                            BindingFlags.Static | BindingFlags.NonPublic));
+                    _harmony.Patch(fpoAwake, prefix: healPrefix);
+                    Log("Prefixed FVRPhysicalObject.Awake with recursive null-healer.");
+                }
+                else
+                {
+                    Warn("FVRPhysicalObject.Awake not found — recursive healer skipped.");
+                }
+            }
+
+            // Serialized magazine data stripped by MeatKit build; swallow the Awake crash.
+            Type magType = ResolveFromH3VR("FistVR.FVRFireArmMagazine");
+            if (magType != null)
+                PatchAwakeWithSwallow(magType);
+
+            // Project script types that NPE on serialized refs stripped by a MeatKit build.
+            Type alofsType = ResolveFromProjectAssembly("BitWizrd.Alamo.AlofsDevice");
+            if (alofsType != null)
+            {
+                HarmonyMethod swallow = new HarmonyMethod(
+                    typeof(PlayHelper).GetMethod("SwallowException",
+                        BindingFlags.Static | BindingFlags.NonPublic));
+                MethodInfo alofsStart  = AccessTools.Method(alofsType, "Start");
+                MethodInfo alofsFU    = AccessTools.Method(alofsType, "FixedUpdate");
+                MethodInfo alofsUpd   = AccessTools.Method(alofsType, "Update");
+                if (alofsStart != null) { _harmony.Patch(alofsStart, finalizer: swallow); Log("Finalizer-patched AlofsDevice.Start."); }
+                if (alofsFU   != null) { _harmony.Patch(alofsFU,    finalizer: swallow); Log("Finalizer-patched AlofsDevice.FixedUpdate."); }
+                if (alofsUpd  != null) { _harmony.Patch(alofsUpd,   finalizer: swallow); Log("Finalizer-patched AlofsDevice.Update."); }
+            }
         }
         catch (Exception ex)
         {
-            Debug.LogWarning("[PlayHelper] ApplyInitPatches failed: " + ex.Message
+            Warn("ApplyInitPatches failed: " + ex.Message
                 + ". Managers will still be created but Awake exceptions may be logged.");
         }
     }
@@ -282,7 +490,7 @@ public static class PlayHelper
         {
             if (method == null)
             {
-                Debug.LogWarning("[PlayHelper] PatchSafely: resolved method is null, skipping.");
+                Warn("PatchSafely: resolved method is null, skipping.");
                 return;
             }
             _harmony.Patch(method, prefix: prefix);
@@ -290,13 +498,14 @@ public static class PlayHelper
         }
         catch (Exception ex)
         {
-            Debug.LogWarning("[PlayHelper] Failed to patch "
+            Warn("Failed to patch "
                 + (method != null ? method.DeclaringType.Name + "." + method.Name : "null")
                 + ": " + ex.Message);
         }
     }
 
-    // Sets ManagerSingleton<T>.Instance for managers whose Awake was no-op'd.
+    // Sets ManagerSingleton<T>.Instance via reflection.  Tries three approaches to
+    // work around a Mono 2.0 bug where GetProperty on closed generic static props returns null.
     private static void SetManagerSingletonInstance(Type managerType, GameObject go)
     {
         try
@@ -304,31 +513,98 @@ public static class PlayHelper
             Type genericMs = ResolveFromH3VR("FistVR.ManagerSingleton`1");
             if (genericMs == null)
             {
-                Debug.LogWarning("[PlayHelper] ManagerSingleton`1 not found in H3VRCode-CSharp.");
+                Warn("ManagerSingleton`1 not found in H3VRCode-CSharp.");
                 return;
             }
 
             Type closedMs = genericMs.MakeGenericType(managerType);
-            PropertyInfo prop = closedMs.GetProperty("Instance",
-                BindingFlags.Public | BindingFlags.Static);
-            if (prop == null) return;
-
             Component comp = go.GetComponent(managerType);
             if (comp == null) return;
 
-            prop.SetValue(null, comp, null);
-            Log("Set ManagerSingleton<" + managerType.Name + ">.Instance.");
+            bool instanceSet = false;
+
+            // Approach 1 — backing field by exact name (normal C# compiler output)
+            FieldInfo backingField = closedMs.GetField("<Instance>k__BackingField",
+                BindingFlags.NonPublic | BindingFlags.Static);
+            if (backingField != null)
+            {
+                backingField.SetValue(null, comp);
+                instanceSet = true;
+                Log("Set ManagerSingleton<" + managerType.Name + ">.Instance via backing field (exact name).");
+            }
+
+            // Approach 2 — scan all static fields for one matching T.
+            if (!instanceSet)
+            {
+                FieldInfo[] allStatic = closedMs.GetFields(
+                    BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+                for (int i = 0; i < allStatic.Length; i++)
+                {
+                    FieldInfo f = allStatic[i];
+                    if (f.FieldType == managerType || managerType.IsAssignableFrom(f.FieldType))
+                    {
+                        f.SetValue(null, comp);
+                        instanceSet = true;
+                        Log("Set ManagerSingleton<" + managerType.Name + ">.Instance via field scan ('" + f.Name + "').");
+                        break;
+                    }
+                }
+            }
+
+            // Approach 3 — property reflection
+            if (!instanceSet)
+            {
+                PropertyInfo prop = closedMs.GetProperty("Instance",
+                    BindingFlags.Public | BindingFlags.Static);
+                if (prop == null)
+                    prop = AccessTools.Property(closedMs, "Instance");
+                if (prop != null)
+                {
+                    prop.SetValue(null, comp, null);
+                    instanceSet = true;
+                    Log("Set ManagerSingleton<" + managerType.Name + ">.Instance via property.");
+                }
+            }
+
+            // Verify — GetProperty returns null on Mono 2.0; use field scan to read back.
+            object readBack = null;
+            FieldInfo[] verifyFields = closedMs.GetFields(
+                BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public);
+            for (int i = 0; i < verifyFields.Length; i++)
+            {
+                FieldInfo vf = verifyFields[i];
+                if (vf.FieldType == managerType || managerType.IsAssignableFrom(vf.FieldType))
+                {
+                    readBack = vf.GetValue(null);
+                    break;
+                }
+            }
+
+            if (readBack == null && !instanceSet)
+            {
+                Warn("SetManagerSingletonInstance: all approaches failed for "
+                    + managerType.Name + " — Instance is null; FVRPhysicalObject.Awake will NullRef.");
+            }
+            else if (readBack == null)
+            {
+                // Approaches reported success but field reads null (Mono 2.0 static generic
+                // field write bug); compiled Awake path may still work.
+                Warn("SetManagerSingletonInstance: Instance reads back null for "
+                    + managerType.Name + " (Mono 2.0 static generic field bug — compiled Awake path may still work).");
+            }
+            else
+            {
+                Log("Verified ManagerSingleton<" + managerType.Name + ">.Instance is non-null.");
+            }
         }
         catch (Exception ex)
         {
-            Debug.LogWarning("[PlayHelper] SetManagerSingletonInstance failed for "
+            Warn("SetManagerSingletonInstance failed for "
                 + managerType.Name + ": " + ex.Message);
         }
     }
 
-    // Returns the existing manager GO if one already exists, otherwise creates a new one.
-    // Returning the existing GO on re-entry ensures SetManagerSingletonInstance is always called
-    // (domain reload resets all statics, but DontDestroyOnLoad objects persist).
+    // Creates a manager GO or reuses an existing one if the scene already has it.
     private static GameObject CreateEditorManager(Type componentType, string goName)
     {
         try
@@ -350,14 +626,13 @@ public static class PlayHelper
         }
         catch (Exception ex)
         {
-            Debug.LogWarning("[PlayHelper] Failed to create " + componentType.Name
+            Warn("Failed to create " + componentType.Name
                 + ": " + ex.Message);
             return null;
         }
     }
 
-    // Wires GM.m_currentSceneSettings and calls InitEventSignalCollections so
-    // FlushSignalCollections on play-exit doesn't NullRef on uninitialised slots.
+    // Wires GM.m_currentSceneSettings and initialises event signal collections.
     private static void SetCurrentSceneSettings(Type gmType, Type ssType, GameObject ssGO)
     {
         try
@@ -384,12 +659,12 @@ public static class PlayHelper
             }
             else
             {
-                Debug.LogWarning("[PlayHelper] InitEventSignalCollections not found on FVRSceneSettings.");
+                Warn("InitEventSignalCollections not found on FVRSceneSettings.");
             }
         }
         catch (Exception ex)
         {
-            Debug.LogWarning("[PlayHelper] SetCurrentSceneSettings failed: " + ex.Message);
+            Warn("SetCurrentSceneSettings failed: " + ex.Message);
         }
     }
 
@@ -405,8 +680,7 @@ public static class PlayHelper
         return null;
     }
 
-    // Seeds SM.m_prefabBindingDic with a dummy AudioSource GO per FVRPooledAudioType
-    // so AudioSourcePool..ctor doesn't throw KeyNotFoundException.
+    // Seeds SM.m_prefabBindingDic with a dummy AudioSource per pool type.
     private static void PopulateSMPrefabBindingDictionary(Type smType)
     {
         try
@@ -418,7 +692,7 @@ public static class PlayHelper
                 BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
             if (dictField == null)
             {
-                Debug.LogWarning("[PlayHelper] m_prefabBindingDic field not found on SM.");
+                Warn("m_prefabBindingDic field not found on SM.");
                 return;
             }
 
@@ -465,7 +739,7 @@ public static class PlayHelper
         catch (Exception ex)
         {
             Exception inner = ex.InnerException != null ? ex.InnerException : ex;
-            Debug.LogWarning("[PlayHelper] PopulateSMPrefabBindingDictionary failed: " + inner.Message);
+            Warn("PopulateSMPrefabBindingDictionary failed: " + inner.Message);
         }
     }
 
@@ -478,7 +752,7 @@ public static class PlayHelper
                 BindingFlags.Public | BindingFlags.Static | BindingFlags.NonPublic);
             if (warmup == null)
             {
-                Debug.LogWarning("[PlayHelper] WarmupGenericPools not found on SM.");
+                Warn("WarmupGenericPools not found on SM.");
                 return;
             }
             warmup.Invoke(null, null);
@@ -486,9 +760,9 @@ public static class PlayHelper
         }
         catch (Exception ex)
         {
-            // MethodInfo.Invoke wraps real errors in TargetInvocationException; log InnerException.
+            // Unwrap TargetInvocationException to get the real error.
             Exception inner = ex.InnerException != null ? ex.InnerException : ex;
-            Debug.LogWarning("[PlayHelper] WarmupSMGenericPools failed: " + inner.GetType().Name + ": " + inner.Message);
+            Warn("WarmupSMGenericPools failed: " + inner.GetType().Name + ": " + inner.Message);
         }
     }
 
@@ -506,13 +780,12 @@ public static class PlayHelper
         }
         catch (Exception ex)
         {
-            Debug.LogWarning("[PlayHelper] DisableComponent failed for "
+            Warn("DisableComponent failed for "
                 + componentType.Name + ": " + ex.Message);
         }
     }
 
-    // Seeds AM.MechanicalAccuracyDic with zero-spread entries so GetFireArmMechanicalSpread
-    // doesn't throw KeyNotFoundException on every FVRFireArm.Awake.
+    // Seeds AM.MechanicalAccuracyDic with zero-spread entries for all accuracy classes.
     private static void PopulateAMAccuracyDictionary(Type amType)
     {
         try
@@ -524,7 +797,7 @@ public static class PlayHelper
                 BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
             if (dictField == null)
             {
-                Debug.LogWarning("[PlayHelper] MechanicalAccuracyDic field not found on AM.");
+                Warn("MechanicalAccuracyDic field not found on AM.");
                 return;
             }
 
@@ -532,7 +805,7 @@ public static class PlayHelper
             if (dict == null) return;
 
             Type accuracyClassType = ResolveFromH3VR("FistVR.FVRFireArmMechanicalAccuracyClass");
-            // Nested type — reflection uses '+' as separator
+            // Nested type — reflection uses '+' as separator.
             Type entryType = ResolveFromH3VR(
                 "FistVR.FVRFireArmMechanicalAccuracyChart+MechanicalAccuracyEntry");
             if (accuracyClassType == null || entryType == null) return;
@@ -556,7 +829,7 @@ public static class PlayHelper
         }
         catch (Exception ex)
         {
-            Debug.LogWarning("[PlayHelper] PopulateAMAccuracyDictionary failed: " + ex.Message);
+            Warn("PopulateAMAccuracyDictionary failed: " + ex.Message);
         }
     }
 
@@ -574,7 +847,7 @@ public static class PlayHelper
             Type audioEvType  = ResolveFromH3VR("FistVR.AudioEvent");
             if (impactType == null || matType == null || intensityType == null || audioEvType == null)
             {
-                Debug.LogWarning("[PlayHelper] SeedSMImpactDictionary: could not resolve enum/AudioEvent types.");
+                Warn("SeedSMImpactDictionary: could not resolve enum/AudioEvent types.");
                 return;
             }
 
@@ -623,12 +896,11 @@ public static class PlayHelper
         }
         catch (Exception ex)
         {
-            Debug.LogWarning("[PlayHelper] SeedSMImpactDictionary failed: " + ex.Message);
+            Warn("SeedSMImpactDictionary failed: " + ex.Message);
         }
     }
 
-    // Seeds FXM.muzzleDic with dummy MuzzleEffectConfig entries backed by invisible
-    // ParticleSystem GOs so RegenerateMuzzleEffects doesn't throw KeyNotFoundException.
+    // Seeds FXM.muzzleDic with dummy MuzzleEffectConfig entries for all muzzle effect types.
     private static void PopulateFXMMuzzleDictionary(Type fxmType)
     {
         try
@@ -640,7 +912,7 @@ public static class PlayHelper
                 BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
             if (dictField == null)
             {
-                Debug.LogWarning("[PlayHelper] muzzleDic field not found on FXM.");
+                Warn("muzzleDic field not found on FXM.");
                 return;
             }
 
@@ -682,10 +954,10 @@ public static class PlayHelper
             MethodInfo clearMethod = dict.GetType().GetMethod("Clear");
             if (addMethod == null) return;
 
-            // Clear so stale ScriptableObject configs from prior sessions don't linger.
+            // Clear stale entries from previous sessions.
             if (clearMethod != null) clearMethod.Invoke(dict, null);
 
-            object noneValue = null; // None entry is never looked up, skip it.
+            object noneValue = null;
             try { noneValue = Enum.Parse(entryEnumType, "None"); }
             catch (Exception) { /* enum may not define None */ }
 
@@ -717,7 +989,7 @@ public static class PlayHelper
         }
         catch (Exception ex)
         {
-            Debug.LogWarning("[PlayHelper] PopulateFXMMuzzleDictionary failed: " + ex.Message);
+            Warn("PopulateFXMMuzzleDictionary failed: " + ex.Message);
         }
     }
 
@@ -734,6 +1006,26 @@ public static class PlayHelper
             if (name != "H3VRCode-CSharp" && name != "H3VRCode-CSharp-firstpass")
                 continue;
 
+            Type t = asm.GetType(fullTypeName);
+            if (t != null) return t;
+        }
+        return null;
+    }
+
+    // Searches project and mod assemblies for a named type (excludes H3VRCode and system libs).
+    private static Type ResolveFromProjectAssembly(string fullTypeName)
+    {
+        Assembly[] assemblies = AppDomain.CurrentDomain.GetAssemblies();
+        for (int i = 0; i < assemblies.Length; i++)
+        {
+            Assembly asm = assemblies[i];
+            if (asm == null) continue;
+            string name = asm.GetName().Name;
+            if (name.StartsWith("System") || name.StartsWith("mscorlib")
+                || name.StartsWith("UnityEngine") || name.StartsWith("UnityEditor")
+                || name == "H3VRCode-CSharp" || name == "H3VRCode-CSharp-firstpass"
+                || name == "0Harmony" || name == "HarmonyLib")
+                continue;
             Type t = asm.GetType(fullTypeName);
             if (t != null) return t;
         }
