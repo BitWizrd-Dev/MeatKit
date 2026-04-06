@@ -12,11 +12,18 @@ namespace MeatKit
         public long MonoScriptTransferRead { get; set; }
         public long ShutdownManaged { get; set; }
         public long StringAssign { get; set; }
+        public long ExtractAssemblyTypeInfoAll { get; set; }
+        public long AssemblyHasValidTypeInfo { get; set; }
+        public long BuildPlayerExtractAndValidateScriptTypes { get; set; }
+        public long AssemblyCheckSkipCondition { get; set; }
+        public long RequestScriptReload { get; set; }
+        public long MonoThreadSuspendAllOtherThreads { get; set; }
     }
 
     public class EditorVersion
     {
         public NativeHookFunctionOffsets FunctionOffsets { get; set; }
+        public bool IsLegacyUnsupported { get; set; }
 
         private static bool _hasShownPopup = false;
         
@@ -24,19 +31,30 @@ namespace MeatKit
         {
             get
             {
-                bool supported = SupportedVersions.ContainsKey(Application.unityVersion);
+                EditorVersion version;
+                bool exists = SupportedVersions.TryGetValue(Application.unityVersion, out version);
                 
-                if (!supported && !_hasShownPopup)
+                if (!exists && !_hasShownPopup)
                 {
-                    // Show the warning popup about the wrong version if is hasn't come up already.
                     string validVersion = string.Join(", ", SupportedVersions.Keys.ToArray());
                     EditorUtility.DisplayDialog("Wrong editor version",
                         "You are using Unity version " + Application.unityVersion + ", MeatKit requires one of the following: " + validVersion,
                         "I'll go install that.");
                     _hasShownPopup = true;
+                    return false;
+                }
+                
+                if (exists && version.IsLegacyUnsupported && !_hasShownPopup)
+                {
+                    EditorUtility.DisplayDialog("Unsupported Unity version",
+                        "Unity " + Application.unityVersion + " is no longer supported.\n\n" +
+                        "Please install and use Unity 5.6.7f1 instead.",
+                        "I'll go install 5.6.7f1.");
+                    _hasShownPopup = true;
+                    return false;
                 }
 
-                return supported;
+                return exists && !version.IsLegacyUnsupported;
             }
         }
 
@@ -45,9 +63,9 @@ namespace MeatKit
             get
             {
                 EditorVersion currentVersion;
-                if (SupportedVersions.TryGetValue(Application.unityVersion, out currentVersion))
-                    return currentVersion;
-                throw new NotSupportedException("The current editor version is not in the list of supported versions.");
+                if (!SupportedVersions.TryGetValue(Application.unityVersion, out currentVersion) || currentVersion.IsLegacyUnsupported)
+                    throw new NotSupportedException("The current editor version is not in the list of supported versions.");
+                return currentVersion;
             }
         }
 
@@ -56,13 +74,8 @@ namespace MeatKit
             {
                 "5.6.3p4", new EditorVersion
                 {
-                    FunctionOffsets = new NativeHookFunctionOffsets
-                    {
-                        MonoScriptTransferWrite = 0xE321E0,
-                        MonoScriptTransferRead = 0xE34000,
-                        ShutdownManaged = 0x17542D0,
-                        StringAssign = 0x1480
-                    }
+                    FunctionOffsets = new NativeHookFunctionOffsets(),
+                    IsLegacyUnsupported = true
                 }
             },
             {
@@ -73,7 +86,13 @@ namespace MeatKit
                         MonoScriptTransferWrite = 0xE39BF0,
                         MonoScriptTransferRead = 0xE3BA10,
                         ShutdownManaged = 0x175D2C0,
-                        StringAssign = 0x1480
+                        StringAssign = 0x1480,
+                        ExtractAssemblyTypeInfoAll = 0x2BAAD0,
+                        AssemblyHasValidTypeInfo = 0x1233CB0,
+                        BuildPlayerExtractAndValidateScriptTypes = 0x2BD9A0,
+                        AssemblyCheckSkipCondition = 0x1B7570,
+                        RequestScriptReload = 0x1741A30,
+                        MonoThreadSuspendAllOtherThreads = 0xA51C0
                     }
                 }
             },
