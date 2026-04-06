@@ -44,11 +44,13 @@ namespace MeatKit
             catch (System.Threading.ThreadAbortException)
             {
                 System.Threading.Thread.ResetAbort();
+                NativeHookManager.InsideEATI = false;
                 BuildLog.SetCompletionStatus(true, "Build interrupted by domain reload.", null);
                 Debug.LogWarning("[MeatKit] Build was interrupted by a domain reload. Please try again.");
             }
             catch (MeatKitBuildException e)
             {
+                NativeHookManager.InsideEATI = false;
                 string message = e.Message;
                 if (e.InnerException != null) message += "\n\n" + e.InnerException.Message;
                 EditorUtility.DisplayDialog("Build failed", message, "Ok.");
@@ -57,6 +59,7 @@ namespace MeatKit
             }
             catch (Exception e)
             {
+                NativeHookManager.InsideEATI = false;
                 EditorUtility.DisplayDialog("Build failed with unknown error",
                     "Error message: " + e.Message + "\n\nCheck console for full exception text.", "Ok.");
                 Debug.LogException(e);
@@ -100,11 +103,24 @@ namespace MeatKit
             BuildLog.WriteLine("Cleaning build folder");
             CleanBuild(profile);
 
-            // Make a copy of the editor assembly because when we build an asset bundle, Unity will delete it
+            // Back up both editor assemblies before BuildAssetBundles replaces them.
             string editorAssembly = EditorAssemblyPath + AssemblyName + ".dll";
             string tempAssemblyFile = Path.GetTempFileName();
-            BuildLog.WriteLine("Copying editor assembly: " + editorAssembly + " -> " + tempAssemblyFile);
+            DateTime originalAsmMtime = File.GetLastWriteTimeUtc(editorAssembly);
+            BuildLog.WriteLine("Backing up editor assembly");
             File.Copy(editorAssembly, tempAssemblyFile, true);
+
+            string editorFirstpassAssembly = EditorAssemblyPath + AssemblyFirstpassName + ".dll";
+            string tempFirstpassFile = null;
+            DateTime originalFirstpassMtime = default(DateTime);
+            if (File.Exists(editorFirstpassAssembly))
+            {
+                tempFirstpassFile = Path.GetTempFileName();
+                originalFirstpassMtime = File.GetLastWriteTimeUtc(editorFirstpassAssembly);
+                BuildLog.WriteLine("Backing up editor firstpass assembly");
+                try { File.Copy(editorFirstpassAssembly, tempFirstpassFile, true); }
+                catch (Exception ex) { BuildLog.WriteLine("WARNING: Failed to back up firstpass DLL: " + ex.Message); tempFirstpassFile = null; }
+            }
             
             // Make sure we have the virtual reality supported checkbox enabled
             // If this is not set to true when we build our asset bundles, the shaders will not compile correctly
@@ -151,13 +167,42 @@ namespace MeatKit
 
             BuildLog.WriteLine(bundles.Length + " bundles to build. Building bundles.");
 
-            // Refresh per-GUID TypeTree cache so OrigMonoScriptTransferWrite writes correct
-            // FVRObject field layouts. Without this the Transfer hook's temporary assembly rename
-            // causes a stale-cache fallback that writes empty TypeTrees (items don't spawn).
-            ManagedPluginDomainFix.PrimeTypeTreesForBuild();
+            if (!NativeHookManager.EATIHookInstalled)
+                BuildLog.WriteLine("WARNING: EATI hook not installed — TypeTree guard inactive.");
+            if (NativeHookManager.AHVTIHookInstalled)
+                BuildLog.WriteLine("AHVTI hook active — H3VRCode TypeTree will be preserved natively.");
+            else
+                BuildLog.WriteLine("AHVTI hook not installed — falling back to TypeTree backup/restore.");
+
+            Dictionary<string, byte[]> _eatICapturedBackup = null;
+            Action _beforeEATI = delegate
+            {
+                NativeHookManager.InsideEATI = true;
+                if (_eatICapturedBackup == null)
+                    _eatICapturedBackup = ManagedPluginDomainFix.BackupH3VRCodeTypeTreeCache();
+            };
+
+            Action _afterEATI = delegate
+            {
+                ManagedPluginDomainFix.RestoreH3VRCodeTypeTreeCache(_eatICapturedBackup);
+                ManagedPluginDomainFix._pendingShutdownRestore = _eatICapturedBackup;
+                BuildLog.WriteLine("Post-EATI: TypeTree metadata restored");
+            };
+
+            NativeHookManager.BeforeEATICallbacks.Add(_beforeEATI);
+            NativeHookManager.AfterEATICallbacks.Add(_afterEATI);
 
             var bundleManifest = BuildPipeline.BuildAssetBundles(bundleOutputPath, bundles,
                 BuildAssetBundleOptions.ChunkBasedCompression, BuildTarget.StandaloneWindows64);
+
+            NativeHookManager.BeforeEATICallbacks.Remove(_beforeEATI);
+            NativeHookManager.AfterEATICallbacks.Remove(_afterEATI);
+            BuildLog.WriteLine("PostBuild: InsideEATI kept True to guard post-build compilation EATI");
+            if (_eatICapturedBackup != null && _eatICapturedBackup.Count > 0)
+            {
+                ManagedPluginDomainFix.RestoreH3VRCodeTypeTreeCache(_eatICapturedBackup);
+                BuildLog.WriteLine("PostBuild: eager TypeTree restore (main + .info files)");
+            }
 
             if (bundleManifest == null)
                 throw new MeatKitBuildException("AssetBundle build failed to produce a manifest. Check the console for errors.");
@@ -165,6 +210,37 @@ namespace MeatKit
             // Disable bundle processing now that we're done with it.
             AssetBundleIO.DisableProcessing();
             BuildLog.WriteLine("Bundles built");
+
+            // Unconditionally restore both editor DLLs with original mtime.
+            string _editorAsmPath = EditorAssemblyPath + AssemblyName + ".dll";
+            if (File.Exists(tempAssemblyFile))
+            {
+                try
+                {
+                    File.Copy(tempAssemblyFile, _editorAsmPath, true);
+                    File.SetLastWriteTimeUtc(_editorAsmPath, originalAsmMtime);
+                    BuildLog.WriteLine("Restored Assembly-CSharp.dll");
+                }
+                catch (Exception ex)
+                {
+                    BuildLog.WriteLine("WARNING: Failed to restore Assembly-CSharp.dll: " + ex.Message);
+                }
+            }
+
+            string _editorFirstpassPath = EditorAssemblyPath + AssemblyFirstpassName + ".dll";
+            if (tempFirstpassFile != null && File.Exists(tempFirstpassFile))
+            {
+                try
+                {
+                    File.Copy(tempFirstpassFile, _editorFirstpassPath, true);
+                    File.SetLastWriteTimeUtc(_editorFirstpassPath, originalFirstpassMtime);
+                    BuildLog.WriteLine("Restored Assembly-CSharp-firstpass.dll");
+                }
+                catch (Exception ex)
+                {
+                    BuildLog.WriteLine("WARNING: Failed to restore Assembly-CSharp-firstpass.dll: " + ex.Message);
+                }
+            }
 
             // Cleanup the unused files created with building the bundles
             BuildLog.WriteLine("Cleaning unused files");
@@ -273,8 +349,6 @@ namespace MeatKit
                 if (File.Exists(readmePath))
                     EditorUtility.RevealInFinder(readmePath);
             }
-
-            ManagedPluginDomainFix.RepairNow();
 
             // End the stopwatch and save the time
             BuildLog.SetCompletionStatus(false, "", null);
