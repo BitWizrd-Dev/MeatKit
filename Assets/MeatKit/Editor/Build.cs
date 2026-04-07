@@ -19,7 +19,6 @@ namespace MeatKit
         {
             if (_buildRunning)
             {
-                Debug.LogWarning("[MeatKit] DoBuild called while a build is already running — ignoring.");
                 return;
             }
 
@@ -103,38 +102,35 @@ namespace MeatKit
             BuildLog.WriteLine("Cleaning build folder");
             CleanBuild(profile);
 
-            // Back up both editor assemblies before BuildAssetBundles replaces them.
-            string editorAssembly = EditorAssemblyPath + AssemblyName + ".dll";
-            string tempAssemblyFile = Path.GetTempFileName();
-            DateTime originalAsmMtime = File.GetLastWriteTimeUtc(editorAssembly);
-            BuildLog.WriteLine("Backing up editor assembly");
+            // Make a copy of the editor assembly because when we build an asset bundle, Unity will delete it
+            string editorAssembly  = EditorAssemblyPath + AssemblyName + ".dll";
+            string editorFirstpass = EditorAssemblyPath + AssemblyFirstpassName + ".dll";
+            string tempAssemblyFile  = Path.GetTempFileName();
+            string tempFirstpassFile = Path.GetTempFileName();
+            DateTime editorAsmMtime = File.GetLastWriteTimeUtc(editorAssembly);
+            DateTime editorFpMtime  = File.Exists(editorFirstpass) ? File.GetLastWriteTimeUtc(editorFirstpass) : DateTime.UtcNow;
+            BuildLog.WriteLine("Copying editor assembly: " + editorAssembly + " -> " + tempAssemblyFile);
             File.Copy(editorAssembly, tempAssemblyFile, true);
-
-            string editorFirstpassAssembly = EditorAssemblyPath + AssemblyFirstpassName + ".dll";
-            string tempFirstpassFile = null;
-            DateTime originalFirstpassMtime = default(DateTime);
-            if (File.Exists(editorFirstpassAssembly))
+            if (File.Exists(editorFirstpass))
             {
-                tempFirstpassFile = Path.GetTempFileName();
-                originalFirstpassMtime = File.GetLastWriteTimeUtc(editorFirstpassAssembly);
-                BuildLog.WriteLine("Backing up editor firstpass assembly");
-                try { File.Copy(editorFirstpassAssembly, tempFirstpassFile, true); }
-                catch (Exception ex) { BuildLog.WriteLine("WARNING: Failed to back up firstpass DLL: " + ex.Message); tempFirstpassFile = null; }
+                BuildLog.WriteLine("Copying editor firstpass: " + editorFirstpass + " -> " + tempFirstpassFile);
+                File.Copy(editorFirstpass, tempFirstpassFile, true);
             }
-            
+
             // Make sure we have the virtual reality supported checkbox enabled
             // If this is not set to true when we build our asset bundles, the shaders will not compile correctly
             BuildLog.WriteLine("Forcing VR support on");
             bool wasVirtualRealitySupported = PlayerSettings.virtualRealitySupported;
             PlayerSettings.virtualRealitySupported = true;
 
-            // Create a map of assembly names to what we want to rename them to, then enable bundle processing
+            // Create a map of assembly names to what we want to rename them to, then enable bundle processing.
+            // H3VRCode-CSharp entries are intentionally absent: the hook no longer renames them
+            // in-place (which corrupted m_ScriptCache on the second build). Instead,
+            // PostProcessBundles() does a safe binary replacement after BuildAssetBundles.
             var replaceMap = new Dictionary<string, string>
             {
                 {AssemblyName + ".dll", profile.PackageName + ".dll"},
-                {AssemblyFirstpassName + ".dll", profile.PackageName + "-firstpass.dll"},
-                {AssemblyRename + ".dll", AssemblyName + ".dll"},
-                {AssemblyFirstpassRename + ".dll", AssemblyFirstpassName + ".dll"}
+                {AssemblyFirstpassName + ".dll", profile.PackageName + "-firstpass.dll"}
             };
             BuildLog.WriteLine("Enabling bundle processing.");
             BuildLog.WriteLine("Replace map:");
@@ -167,27 +163,32 @@ namespace MeatKit
 
             BuildLog.WriteLine(bundles.Length + " bundles to build. Building bundles.");
 
-            if (!NativeHookManager.EATIHookInstalled)
-                BuildLog.WriteLine("WARNING: EATI hook not installed — TypeTree guard inactive.");
-            if (NativeHookManager.AHVTIHookInstalled)
-                BuildLog.WriteLine("AHVTI hook active — H3VRCode TypeTree will be preserved natively.");
-            else
-                BuildLog.WriteLine("AHVTI hook not installed — falling back to TypeTree backup/restore.");
-
+            // Guard H3VRCode TypeTree during BuildAssetBundles. EATI (ExtractAssemblyTypeInfoAll) is a native
+            // Unity function that extracts type metadata; we back up before it runs and restore after to prevent
+            // it from overwriting our H3VRCode TypeTree modifications.
             Dictionary<string, byte[]> _eatICapturedBackup = null;
             Action _beforeEATI = delegate
             {
+                // Ensure H3VRCode DLLs are in Library/ScriptAssemblies/ BEFORE EATI processes them.
+                ManagedPluginDomainFix.EnsureH3VRCodeInScriptAssemblies();
                 NativeHookManager.InsideEATI = true;
+                NativeHookManager.InsideBundleEATI = true;
+                ManagedPluginDomainFix.ReprimeMBCachesBeforeEATI();
                 if (_eatICapturedBackup == null)
+                {
                     _eatICapturedBackup = ManagedPluginDomainFix.BackupH3VRCodeTypeTreeCache();
+                }
             };
 
             Action _afterEATI = delegate
             {
-                ManagedPluginDomainFix.RestoreH3VRCodeTypeTreeCache(_eatICapturedBackup);
+                ManagedPluginDomainFix.ReprimeSilentAfterEATI();
                 ManagedPluginDomainFix._pendingShutdownRestore = _eatICapturedBackup;
-                BuildLog.WriteLine("Post-EATI: TypeTree metadata restored");
             };
+
+            // Prime TypeTrees before EATI hooks are registered so SaveAssets() inside
+            // PrimeTypeTreesForBuild() cannot race with the backup/restore callbacks.
+            ManagedPluginDomainFix.PrimeTypeTreesForBuild();
 
             NativeHookManager.BeforeEATICallbacks.Add(_beforeEATI);
             NativeHookManager.AfterEATICallbacks.Add(_afterEATI);
@@ -197,12 +198,7 @@ namespace MeatKit
 
             NativeHookManager.BeforeEATICallbacks.Remove(_beforeEATI);
             NativeHookManager.AfterEATICallbacks.Remove(_afterEATI);
-            BuildLog.WriteLine("PostBuild: InsideEATI kept True to guard post-build compilation EATI");
-            if (_eatICapturedBackup != null && _eatICapturedBackup.Count > 0)
-            {
-                ManagedPluginDomainFix.RestoreH3VRCodeTypeTreeCache(_eatICapturedBackup);
-                BuildLog.WriteLine("PostBuild: eager TypeTree restore (main + .info files)");
-            }
+            NativeHookManager.InsideBundleEATI = false;
 
             if (bundleManifest == null)
                 throw new MeatKitBuildException("AssetBundle build failed to produce a manifest. Check the console for errors.");
@@ -211,14 +207,44 @@ namespace MeatKit
             AssetBundleIO.DisableProcessing();
             BuildLog.WriteLine("Bundles built");
 
-            // Unconditionally restore both editor DLLs with original mtime.
-            string _editorAsmPath = EditorAssemblyPath + AssemblyName + ".dll";
+            // Restore H3VRCode DLLs to Library/ScriptAssemblies/ immediately.
+            // BuildAssetBundles deletes them during its standalone compile, and the post-build
+            // domain reload's compiler needs them to resolve FistVR types (H3VR_IMPORTED guard).
+            // The delayCall in ManagedPluginDomainFix also does this, but too late — the compiler
+            // runs before delayCall fires.
+            ManagedPluginDomainFix.EnsureH3VRCodeInScriptAssemblies();
+            BuildLog.WriteLine("Restored H3VRCode DLLs to ScriptAssemblies");
+
+            // If the firstpass backup was empty (file was absent before the build), the standalone
+            // compile inside BuildAssetBundles will have written a real Assembly-CSharp-firstpass.dll
+            // to Library/ScriptAssemblies/.  Capture it now into tempFirstpassFile so the restore
+            // below puts valid bytes back with the original mtime.  Using the original mtime is
+            // critical: Unity 5.6 uses mtime-only change detection for DLLs, so restoring T0
+            // prevents a spurious editor recompile.  Without this, the editor recompile produces
+            // a 0-byte firstpass (no .cs sources in Assets/Plugins/) which causes Build 2's
+            // AssemblyHelper.ExtractAssemblyTypeInfo to throw BadImageFormatException.
+            if (new FileInfo(tempFirstpassFile).Length == 0 && File.Exists(editorFirstpass) && new FileInfo(editorFirstpass).Length > 0)
+            {
+                File.Copy(editorFirstpass, tempFirstpassFile, true);
+                BuildLog.WriteLine("Updated firstpass backup with standalone-compiled version (" + new FileInfo(tempFirstpassFile).Length + " bytes)");
+            }
+
+            // ### FIX: Validate firstpass before restore to prevent 0-byte DLL corruption ###
+            // Check if tempFirstpassFile is 0 bytes (invalid). If so, don't restore it.
+            // A 0-byte firstpass causes domain reload BadImageFormatException and Build 2 crash.
+            long firstpassBackupSize = new FileInfo(tempFirstpassFile).Length;
+            bool firstpassBackupIsValid = firstpassBackupSize > 0;
+
+            // Restore both editor DLLs unconditionally with original mtime. The BPEVST hook
+            // suppresses the post-bundle standalone compile, but if it fails the compile would
+            // replace these DLLs with H3VR_IMPORTED-absent versions; the post-build domain
+            // reload would then load wrong DLLs causing null MonoScripts and Anvil fields vanishing.
             if (File.Exists(tempAssemblyFile))
             {
                 try
                 {
-                    File.Copy(tempAssemblyFile, _editorAsmPath, true);
-                    File.SetLastWriteTimeUtc(_editorAsmPath, originalAsmMtime);
+                    File.Copy(tempAssemblyFile, editorAssembly, true);
+                    File.SetLastWriteTimeUtc(editorAssembly, editorAsmMtime);
                     BuildLog.WriteLine("Restored Assembly-CSharp.dll");
                 }
                 catch (Exception ex)
@@ -226,20 +252,23 @@ namespace MeatKit
                     BuildLog.WriteLine("WARNING: Failed to restore Assembly-CSharp.dll: " + ex.Message);
                 }
             }
-
-            string _editorFirstpassPath = EditorAssemblyPath + AssemblyFirstpassName + ".dll";
-            if (tempFirstpassFile != null && File.Exists(tempFirstpassFile))
+            if (firstpassBackupIsValid && File.Exists(tempFirstpassFile))
             {
                 try
                 {
-                    File.Copy(tempFirstpassFile, _editorFirstpassPath, true);
-                    File.SetLastWriteTimeUtc(_editorFirstpassPath, originalFirstpassMtime);
+                    File.Copy(tempFirstpassFile, editorFirstpass, true);
+                    File.SetLastWriteTimeUtc(editorFirstpass, editorFpMtime);
                     BuildLog.WriteLine("Restored Assembly-CSharp-firstpass.dll");
                 }
                 catch (Exception ex)
                 {
                     BuildLog.WriteLine("WARNING: Failed to restore Assembly-CSharp-firstpass.dll: " + ex.Message);
                 }
+            }
+            else if (!firstpassBackupIsValid)
+            {
+                BuildLog.WriteLine("SKIPPED: Assembly-CSharp-firstpass.dll restore — backup is " + firstpassBackupSize + " bytes (invalid)");
+                BuildLog.WriteLine("  This is expected if no firstpass DLL exists in the project.");
             }
 
             // Cleanup the unused files created with building the bundles
@@ -263,6 +292,11 @@ namespace MeatKit
                 File.Move(buildTimeNamePath, originalNamePath);
             }
 
+            // Binary-replace H3VRCode-CSharp → Assembly-CSharp in every output bundle file.
+            // Both strings are 15 bytes, so the replacement is in-place and preserves every
+            // length prefix in the binary format (including MMHOOK-H3VRCode-CSharp variants).
+            PostProcessBundles(bundleOutputPath);
+
             // Reset the virtual reality supported checkbox, so if the user had it disabled it will stay disabled
             PlayerSettings.virtualRealitySupported = wasVirtualRealitySupported;
 
@@ -270,7 +304,8 @@ namespace MeatKit
             BuildLog.WriteLine("Exporting editor assembly");
             var requiredScripts = AssetBundleIO.SerializedScriptNames;
             ExportEditorAssembly(bundleOutputPath, tempAssemblyFile, requiredScripts);
-            File.Delete(tempAssemblyFile);
+            try { if (File.Exists(tempAssemblyFile))  File.Delete(tempAssemblyFile);  } catch { }
+            try { if (File.Exists(tempFirstpassFile)) File.Delete(tempFirstpassFile); } catch { }
 
             // Now we can write the Thunderstore stuff to the folder
             BuildLog.WriteLine("Writing Thunderstore manifest");
@@ -328,25 +363,20 @@ namespace MeatKit
             if (profile.BuildAction == BuildAction.CreateThunderstorePackage)
             {
                 BuildLog.WriteLine("Zipping built files");
-                var zipPath = Path.Combine(bundleOutputPath, packageName + "-" + profile.Version + ".zip");
-                var zip = new ZipFile();
-                try
+                using (var zip = new ZipFile())
                 {
                     zip.AddDirectory(bundleOutputPath, "");
+                    var zipPath = Path.Combine(bundleOutputPath, packageName + "-" + profile.Version + ".zip");
                     zip.Save(zipPath);
+                    
+                    if (MeatKitCache.OpenFolderAfterBuild && File.Exists(zipPath))
+                        EditorUtility.RevealInFinder(zipPath);
                 }
-                finally
-                {
-                    zip.Dispose();
-                }
-
-                if (File.Exists(zipPath))
-                    EditorUtility.RevealInFinder(zipPath);
             }
             else
             {
                 BuildLog.WriteLine("Opening folder with built files");
-                if (File.Exists(readmePath))
+                if (MeatKitCache.OpenFolderAfterBuild && File.Exists(readmePath))
                     EditorUtility.RevealInFinder(readmePath);
             }
 
@@ -363,6 +393,57 @@ namespace MeatKit
             Directory.CreateDirectory(outputPath);
         }
 
+        /// <summary>
+        /// Binary-replaces every occurrence of "H3VRCode-CSharp" with "Assembly-CSharp" in all
+        /// bundle files under <paramref name="outputPath"/>.  Both strings are exactly 15 bytes,
+        /// so no length prefixes or offsets in Unity's binary bundle format are disturbed.
+        /// This covers H3VRCode-CSharp.dll, H3VRCode-CSharp-firstpass.dll, and any MonoMod
+        /// MMHOOK-H3VRCode-CSharp variants — all in a single pass per file.
+        /// </summary>
+        private static void PostProcessBundles(string outputPath)
+        {
+            byte[] oldBytes = System.Text.Encoding.ASCII.GetBytes(AssemblyRename); // "H3VRCode-CSharp" (15)
+            byte[] newBytes = System.Text.Encoding.ASCII.GetBytes(AssemblyName);   // "Assembly-CSharp"  (15)
+            if (oldBytes.Length != newBytes.Length)
+            {
+                BuildLog.WriteLine("[PostProcessBundles] SKIP: assembly name lengths differ (" +
+                                   oldBytes.Length + " vs " + newBytes.Length + ") — binary replacement unsafe");
+                return;
+            }
+            int patched = 0;
+            foreach (var file in Directory.GetFiles(outputPath))
+            {
+                try
+                {
+                    byte[] data = File.ReadAllBytes(file);
+                    bool modified = false;
+                    for (int i = 0; i <= data.Length - oldBytes.Length; i++)
+                    {
+                        bool match = true;
+                        for (int j = 0; j < oldBytes.Length; j++)
+                        {
+                            if (data[i + j] != oldBytes[j]) { match = false; break; }
+                        }
+                        if (match)
+                        {
+                            for (int j = 0; j < newBytes.Length; j++)
+                                data[i + j] = newBytes[j];
+                            i += newBytes.Length - 1;
+                            modified = true;
+                            patched++;
+                        }
+                    }
+                    if (modified)
+                        File.WriteAllBytes(file, data);
+                }
+                catch (Exception ex)
+                {
+                    BuildLog.WriteLine("[PostProcessBundles] WARNING: failed to patch " + file + ": " + ex.Message);
+                }
+            }
+            BuildLog.WriteLine("[PostProcessBundles] Patched " + patched + " occurrence(s) of \"" +
+                               AssemblyRename + "\" → \"" + AssemblyName + "\" across bundle files");
+        }
 
 
     }

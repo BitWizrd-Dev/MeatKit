@@ -30,11 +30,8 @@ namespace MeatKit
         /// <summary>True when the ExtractAssemblyTypeInfoAll native hook was successfully installed.</summary>
         internal static bool EATIHookInstalled { get { return _origEATI != null; } }
 
-        // Fired inside OnExtractAssemblyTypeInfoAll BEFORE the original function runs.
-        // Safe to add/remove from the main (editor) thread.
+        // Fired before/after EATI runs; safe to modify from main thread
         internal static readonly List<Action> BeforeEATICallbacks = new List<Action>();
-
-        // Fired inside OnExtractAssemblyTypeInfoAll AFTER the original function returns.
         internal static readonly List<Action> AfterEATICallbacks = new List<Action>();
 
         // Gates EATI per-assembly; return false to skip TypeTree extraction for that DLL.
@@ -47,8 +44,8 @@ namespace MeatKit
         /// <summary>True when the AssemblyHasValidTypeInfo native hook was successfully installed.</summary>
         internal static bool AHVTIHookInstalled { get { return _origAHVTI != null; } }
 
-        // Post-bundle standalone script compile step; made a no-op during MeatKit builds
-        // to prevent H3VRCode compile failure (it's absent from the freshly-cleared ScriptAssemblies).
+        // Post-bundle standalone script compile step; made a no-op during MeatKit builds to prevent
+        // H3VRCode compile failure (it's absent from the freshly-cleared ScriptAssemblies).
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate byte BuildPlayerExtractAndValidateDelegate(
             long a1, IntPtr a2, uint platformGroup, uint platform, IntPtr a5, long a6, long a7);
@@ -66,8 +63,8 @@ namespace MeatKit
 
         private static AssemblyCheckSkipConditionDelegate _origACSC;
 
-        // Schedules a domain reload. Suppressed during MonoScript repair to prevent an
-        // infinite reload loop (CheckConsistency → FixRuntimeScriptReference → reload → repeat).
+        // Schedules a domain reload. Suppressed during MonoScript repair to prevent an infinite
+        // reload loop (CheckConsistency → FixRuntimeScriptReference → reload → repeat).
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate void d_RequestScriptReload(IntPtr thisApp);
 
@@ -86,11 +83,16 @@ namespace MeatKit
         // The AHVTI hook only skips H3VRCode while this is true; cleared by _afterEATI.
         internal static volatile bool InsideEATI = false;
 
+        // Set true during BuildAssetBundles to block ALL Assets/Managed/ DLL processing
+        // (not just H3VRCode). Cleared after BuildAssetBundles returns so post-build
+        // standalone EATIs do NOT block other plugin DLLs the editor compiler needs.
+        internal static volatile bool InsideBundleEATI = false;
+
         // Keep track of all the applied detours so we can quickly undo them before the mono domain is reloaded
         private static readonly List<NativeDetour> Detours = new List<NativeDetour>();
 
-        // P/Invoke declarations for detecting and terminating the Mono IO-worker thread
-        // before OrigShutdownManaged runs, to avoid a STOA deadlock on post-build close.
+        // P/Invoke declarations for detecting and terminating the Mono IO-worker thread before
+        // OrigShutdownManaged runs, to avoid a STOA deadlock on post-build close.
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern IntPtr OpenThread(uint dwDesiredAccess, bool bInheritHandle, uint dwThreadId);
 
@@ -109,28 +111,25 @@ namespace MeatKit
             IntPtr ThreadHandle, int ThreadInformationClass,
             out IntPtr ThreadInformation, int ThreadInformationLength, IntPtr ReturnLength);
 
-        // Delegate for mono_thread_suspend_all_other_threads (void, no args, cdecl in mono.dll).
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        private delegate void StoaDelegate();
+        // ExitProcess: terminates the process with DLL_PROCESS_DETACH notifications
+        // but WITHOUT running CRT atexit handlers (which is where Mono deadlocks
+        // during cleanup when NativeDetour objects have been created).
+        [DllImport("kernel32.dll")]
+        private static extern void ExitProcess(uint uExitCode);
 
-        private static StoaDelegate _origStoa;
-
-        // The STOA detour is intentionally NOT added to Detours -- see OnShutdownManaged.
-        private static NativeDetour _stoaDetourInstance;
-
-        // Set true in OnShutdownManaged when the Mono IO-worker thread is detected.
-        // When true, OnSuspendAllOtherThreads skips calling the original STOA.
-        private static bool _skipStoa = false;
-
-        // Callbacks fired inside OnShutdownManaged, i.e. after script compilation completes but before
-        // the Mono domain is torn down. This is the ONLY reliable window to run managed code that must
-        // survive into the next domain reload. Register callbacks here instead of AppDomain.DomainUnload
-        // because Unity's Mono embedding does not reliably raise that event.
+        // Fired after compilation but before domain reload; only reliable window for survival code
         internal static readonly List<Action> BeforeShutdownCallbacks = new List<Action>();
 
         static NativeHookManager()
         {
             if (!EditorVersion.IsSupportedVersion) return;
+
+            // Check whether H3VRCode DLLs are present before installing hooks that reference them.
+            string managedDir = System.IO.Path.Combine(Application.dataPath, "Managed");
+            _h3vrCodeExists = System.IO.File.Exists(System.IO.Path.Combine(managedDir, "H3VRCode-CSharp.dll"))
+                           || System.IO.File.Exists(System.IO.Path.Combine(managedDir, "H3VRCode-CSharp-firstpass.dll"));
+
+            NativeHookFunctionOffsets offsets = EditorVersion.Current.FunctionOffsets;
 
             // Apply our detours here and save the trampoline to call the original function.
             // Wrapped in try/catch: if ApplyEditorDetour throws (e.g. wrong binary offset) we must NOT
@@ -139,7 +138,7 @@ namespace MeatKit
             // which would break BeforeShutdownCallbacks.Add() in ManagedPluginDomainFix.
             try
             {
-                OrigShutdownManaged = ApplyEditorDetour<ShutdownManaged>(EditorVersion.Current.FunctionOffsets.ShutdownManaged, new ShutdownManaged(OnShutdownManaged));
+                OrigShutdownManaged = ApplyEditorDetour<ShutdownManaged>(offsets.ShutdownManaged, new ShutdownManaged(OnShutdownManaged));
             }
             catch (Exception ex)
             {
@@ -148,7 +147,7 @@ namespace MeatKit
             }
 
             // Install EATI hook when offset is available for this Unity version.
-            long eatIOffset = EditorVersion.Current.FunctionOffsets.ExtractAssemblyTypeInfoAll;
+            long eatIOffset = offsets.ExtractAssemblyTypeInfoAll;
             if (eatIOffset != 0)
             {
                 try
@@ -167,7 +166,7 @@ namespace MeatKit
             // Install AssemblyHasValidTypeInfo hook to skip H3VRCode assemblies during EATI.
             // When InsideEATI is true, returning false prevents EATI from overwriting
             // Library/metadata for H3VRCode, eliminating TypeTree corruption.
-            long ahvtiOffset = EditorVersion.Current.FunctionOffsets.AssemblyHasValidTypeInfo;
+            long ahvtiOffset = offsets.AssemblyHasValidTypeInfo;
             if (ahvtiOffset != 0)
             {
                 try
@@ -186,7 +185,7 @@ namespace MeatKit
             // Install BuildPlayer_ExtractAndValidateScriptTypes hook.
             // Makes it a no-op (return 1 = success) so the already-valid bundle manifest is
             // preserved and the H3VRCode-less standalone compile doesn't block the build.
-            long bpevstOffset = EditorVersion.Current.FunctionOffsets.BuildPlayerExtractAndValidateScriptTypes;
+            long bpevstOffset = offsets.BuildPlayerExtractAndValidateScriptTypes;
             if (bpevstOffset != 0)
             {
                 try
@@ -204,7 +203,7 @@ namespace MeatKit
 
             // Install Assembly_CheckSkipCondition hook.
             // Forces H3VRCode to be included in the post-build editor recompile reference list.
-            long acscOffset = EditorVersion.Current.FunctionOffsets.AssemblyCheckSkipCondition;
+            long acscOffset = offsets.AssemblyCheckSkipCondition;
             if (acscOffset != 0)
             {
                 try
@@ -220,11 +219,10 @@ namespace MeatKit
                 }
             }
 
-            // Install Application_RequestScriptReload hook.
-            // Suppresses reload requests during the ctor-time H3VRCode MonoScript repair window
-            // to prevent an infinite domain-reload loop caused by CheckConsistency firing on
-            // newly-valid H3VRCode class pointers.
-            long rrOffset = EditorVersion.Current.FunctionOffsets.RequestScriptReload;
+            // Install Application_RequestScriptReload hook. Suppresses reload requests during the
+            // ctor-time H3VRCode MonoScript repair window to prevent an infinite domain-reload loop
+            // caused by CheckConsistency firing on newly-valid H3VRCode class pointers.
+            long rrOffset = offsets.RequestScriptReload;
             if (rrOffset != 0)
             {
                 try
@@ -240,34 +238,55 @@ namespace MeatKit
                 }
             }
 
-            // Hook mono_thread_suspend_all_other_threads in mono.dll.
-            // Skips the call when a Mono IO-worker thread is present to prevent a deadlock on
-            // domain close (the IO worker is blocked in a non-alertable wait and never ACKs).
-            long stoaRva = EditorVersion.Current.FunctionOffsets.MonoThreadSuspendAllOtherThreads;
-            if (stoaRva != 0)
-            {
-                try
-                {
-                    IntPtr monoBase = DynDll.OpenLibrary("mono.dll");
-                    if (monoBase != IntPtr.Zero)
-                    {
-                        IntPtr stoaAddr = (IntPtr)(monoBase.ToInt64() + stoaRva);
-                        var stoaTo = Marshal.GetFunctionPointerForDelegate(new StoaDelegate(OnSuspendAllOtherThreads));
-                        // NOT added to Detours: STOA fires after OnShutdownManaged returns, so this
-                        // hook must outlive the other detours. Self-disposed in OnSuspendAllOtherThreads.
-                        _stoaDetourInstance = new NativeDetour(stoaAddr, stoaTo, new NativeDetourConfig { ManualApply = true });
-                        _origStoa = _stoaDetourInstance.GenerateTrampoline(typeof(StoaDelegate).GetMethod("Invoke")).CreateDelegate(typeof(StoaDelegate)) as StoaDelegate;
-                        _stoaDetourInstance.Apply();
-                    }
-                }
-                catch (Exception ex)
-                {
-                    Debug.LogWarning("[NativeHookManager] Failed to install STOA hook: " + ex.Message);
-                }
-            }
+            // STOA hook REMOVED — permanently making mono_thread_suspend_all_other_threads a no-op
+            // prevented Unity from closing (WM_CLOSE hang: Mono's exit sequence needs STOA to
+            // actually suspend threads before teardown). The original deadlock during domain reload
+            // (caused by Mono IO-worker threads stuck in uninterruptible I/O) is now handled by
+            // TerminateMonoIOWorkers() in OnShutdownManaged, which kills those threads before
+            // OrigShutdownManaged calls into Mono's domain teardown path.
 
             // NOTE: PIOLA and ReloadAllUsedAssemblies hooks are not installed — both are
             // re-entrant from an [InitializeOnLoad] context and cause crashes in mono.dll.
+
+            // Register for EditorApplication.editorApplicationQuit (internal field, accessed via reflection).
+            // Creating NativeDetour objects causes Mono's CRT atexit cleanup to deadlock during exit().
+            // This callback fires inside Application::Terminate, BEFORE the deadlocking exit() call.
+            // We call ExitProcess(0) here to bypass the CRT atexit handlers entirely; this still runs
+            // DLL_PROCESS_DETACH notifications but avoids the Mono cleanup deadlock.
+            RegisterQuitCallback();
+        }
+
+        private static void RegisterQuitCallback()
+        {
+            try
+            {
+                var field = typeof(EditorApplication).GetField(
+                    "editorApplicationQuit",
+                    System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+                if (field != null)
+                {
+                    var existing = (UnityEngine.Events.UnityAction)field.GetValue(null);
+                    field.SetValue(null, (UnityEngine.Events.UnityAction)delegate
+                    {
+                        // Run any previously-registered quit callbacks first
+                        if (existing != null)
+                        {
+                            try { existing(); }
+                            catch { }
+                        }
+                        ExitProcess(0);
+                    });
+                }
+                else
+                {
+                    Debug.LogWarning("[NativeHookManager] editorApplicationQuit field not found — " +
+                                     "editor close may hang. Force-kill with Task Manager if needed.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("[NativeHookManager] Failed to register quit callback: " + ex.Message);
+            }
         }
 
         public static T ApplyEditorDetour<T>(long from, Delegate to) where T : class
@@ -307,20 +326,62 @@ namespace MeatKit
         // trampoline page, causing corrupted memory accesses. H3VRCode references are injected
         // via Assets/mcs.rsp instead.
 
-        // RequestScriptReload hook: returns early when suppression is active.
+        // Saved thisApp pointer from the most-recently suppressed RequestScriptReload call.
+        // Replayed by ManagedPluginDomainFix when suppression is lifted so that any
+        // compilation-complete RequestScriptReload that was swallowed during domain reload
+        // still causes the next compilation pass (and final domain reload) to happen.
+        private static volatile IntPtr _suppressedReloadApp = IntPtr.Zero;
+
+        // RequestScriptReload hook: returns early when suppression is active, but records
+        // the call so it can be replayed once the suppression window closes.
         private static void OnRequestScriptReload(IntPtr thisApp)
         {
             if (SuppressRequestScriptReload)
+            {
+                _suppressedReloadApp = thisApp; // overwrite is fine; all calls use the same App ptr
                 return;
+            }
             _origRequestScriptReload(thisApp);
         }
 
-        // Assembly_CheckSkipCondition hook: return 0 (include) for H3VRCode paths when a5=1
-        // (editor compile), bypassing IsCompatibleWithEditorCPUAndOS exclusion.
+        /// <summary>
+        /// Replays a RequestScriptReload call that was suppressed while
+        /// SuppressRequestScriptReload was true.  Must be called AFTER setting
+        /// SuppressRequestScriptReload = false.  No-op if no call was suppressed.
+        /// </summary>
+        internal static void ReplayPendingScriptReloadIfNeeded()
+        {
+            IntPtr app = _suppressedReloadApp;
+            if (app == IntPtr.Zero || _origRequestScriptReload == null) return;
+            _suppressedReloadApp = IntPtr.Zero; // consume the pending call
+            _origRequestScriptReload(app);
+        }
+
+        /// <summary>
+        /// Discards any pending suppressed RequestScriptReload without replaying it.
+        /// Call this after a successful MonoScript repair (RebuildFromAwake) when all
+        /// scripts are healthy — RebuildFromAwake triggers RequestScriptReload internally
+        /// as a side effect, and that internal call should NOT cause another domain reload.
+        /// </summary>
+        internal static void DiscardPendingScriptReload()
+        {
+            _suppressedReloadApp = IntPtr.Zero;
+        }
+
+        // True when H3VRCode DLLs exist in Assets/Managed/ at load time.
+        // Checked by the ACSC hook so we only force-include when the DLLs are actually present.
+        // Without this guard, a project that never imported H3VRCode would get phantom references
+        // injected into the compiler, causing missing-file errors.
+        private static readonly bool _h3vrCodeExists;
+
+        // Assembly_CheckSkipCondition hook: return 0 (include) for H3VRCode paths in ALL
+        // compiles (editor AND standalone), bypassing IsCompatibleWithEditorCPUAndOS exclusion.
+        // Only activates when the DLLs actually exist on disk — if a user never imported
+        // H3VRCode, the hook falls through to the original behaviour.
         // Unity string layout at a2: *(long*)a2==0 → small string inline at a2+8; else heap char*.
         private static byte OnAssemblyCheckSkipCondition(long a1, long a2, uint a3, uint a4, byte a5, byte a6, long a7)
         {
-            if (a5 != 0 && a2 != 0)
+            if (_h3vrCodeExists && a2 != 0)
             {
                 try
                 {
@@ -394,6 +455,7 @@ namespace MeatKit
 
         private static void OnShutdownManaged()
         {
+            // Unity is about to shutdown the mono runtime! Quickly dispose of our detours!
             // Fire any registered pre-shutdown callbacks before tearing down the domain.
             // try/finally guarantees OrigShutdownManaged() is called even if a callback throws.
             try
@@ -406,50 +468,22 @@ namespace MeatKit
             }
             finally
             {
-                // Set _skipStoa if the Mono IO-worker thread is present. When set, the STOA hook
-                // skips the call to prevent a deadlock (IO worker is blocked in a non-alertable wait).
-                _skipStoa = MonoIOWorkerExists();
-
+                // Do NOT dispose _stoaDetourInstance -- the STOA hook must live until process exit.
                 try
                 {
                     OrigShutdownManaged();
                 }
                 finally
                 {
-                    // STOA fires after this block returns; do NOT dispose _stoaDetourInstance here.
-                    // OnSuspendAllOtherThreads self-disposes it after it fires.
                     foreach (var detour in Detours) detour.Dispose();
                 }
             }
         }
 
-        // Called when mono_thread_suspend_all_other_threads fires.
-        // Skips the call when _skipStoa is set; self-disposes the hook either way.
-        private static void OnSuspendAllOtherThreads()
-        {
-            bool skip = _skipStoa;
-            _skipStoa = false;
 
-            // Self-dispose now -- STOA is already in progress, hook no longer needed.
-            if (_stoaDetourInstance != null)
-            {
-                try { _stoaDetourInstance.Dispose(); }
-                catch { }
-                _stoaDetourInstance = null;
-            }
 
-            if (skip)
-            {
-                Debug.Log("[NativeHookManager] STOA suppressed (Mono IO-worker present)");
-                return;
-            }
-            if (_origStoa != null) _origStoa();
-        }
-
-        /// <summary>
-        /// Returns true if any thread whose Win32 start address lies within mono.dll is running.
-        /// This indicates the Mono socket IO-worker is active and will block STOA indefinitely.
-        /// </summary>
+        // Returns true if any thread whose Win32 start address lies within mono.dll is running.
+        // This indicates the Mono socket IO-worker is active and will block STOA indefinitely.
         private static bool MonoIOWorkerExists()
         {
             try

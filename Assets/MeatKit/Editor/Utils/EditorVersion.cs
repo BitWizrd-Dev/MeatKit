@@ -33,28 +33,19 @@ namespace MeatKit
             {
                 EditorVersion version;
                 bool exists = SupportedVersions.TryGetValue(Application.unityVersion, out version);
+                bool supported = exists && !version.IsLegacyUnsupported;
                 
-                if (!exists && !_hasShownPopup)
+                if (!supported && !_hasShownPopup)
                 {
+                    // Show the warning popup about the wrong version if is hasn't come up already.
                     string validVersion = string.Join(", ", SupportedVersions.Keys.ToArray());
                     EditorUtility.DisplayDialog("Wrong editor version",
                         "You are using Unity version " + Application.unityVersion + ", MeatKit requires one of the following: " + validVersion,
                         "I'll go install that.");
                     _hasShownPopup = true;
-                    return false;
-                }
-                
-                if (exists && version.IsLegacyUnsupported && !_hasShownPopup)
-                {
-                    EditorUtility.DisplayDialog("Unsupported Unity version",
-                        "Unity " + Application.unityVersion + " is no longer supported.\n\n" +
-                        "Please install and use Unity 5.6.7f1 instead.",
-                        "I'll go install 5.6.7f1.");
-                    _hasShownPopup = true;
-                    return false;
                 }
 
-                return exists && !version.IsLegacyUnsupported;
+                return supported;
             }
         }
 
@@ -63,9 +54,9 @@ namespace MeatKit
             get
             {
                 EditorVersion currentVersion;
-                if (!SupportedVersions.TryGetValue(Application.unityVersion, out currentVersion) || currentVersion.IsLegacyUnsupported)
-                    throw new NotSupportedException("The current editor version is not in the list of supported versions.");
-                return currentVersion;
+                if (SupportedVersions.TryGetValue(Application.unityVersion, out currentVersion) && !currentVersion.IsLegacyUnsupported)
+                    return currentVersion;
+                throw new NotSupportedException("The current editor version is not in the list of supported versions.");
             }
         }
 

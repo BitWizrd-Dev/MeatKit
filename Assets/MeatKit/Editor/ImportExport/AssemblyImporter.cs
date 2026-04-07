@@ -1,4 +1,5 @@
-﻿using System.IO;
+﻿using System;
+using System.IO;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
@@ -39,9 +40,13 @@ namespace MeatKit
             foreach (var editor in editors) editor.Applied = false;
 
             // We need a custom assembly resolver that sometimes points to different directories.
+            // IMPORTANT: The resolver must be disposed before AssetDatabase.Refresh() is called,
+            // otherwise its cached AssemblyDefinitions keep FileStreams open on the DLLs and
+            // Unity's AssemblyUpdater hits a sharing violation (especially on external drives).
+            var resolver = new RedirectedAssemblyResolver(assembliesDirectory, destinationDirectory);
             var rParams = new ReaderParameters
             {
-                AssemblyResolver = new RedirectedAssemblyResolver(assembliesDirectory, destinationDirectory)
+                AssemblyResolver = resolver
             };
 
             // Rename the game's firstpass assembly
@@ -62,7 +67,8 @@ namespace MeatKit
                 RemoveEditorOnlyMethodReferences(firstpassAssembly);
 
                 WriteSafely(firstpassAssembly, Path.Combine(destinationDirectory, AssemblyFirstpassRename + ".dll"));
-                firstpassAssembly.Dispose();
+                IDisposable d1 = firstpassAssembly as IDisposable;
+                if (d1 != null) d1.Dispose();
             }
 
             // Main assembly
@@ -117,7 +123,14 @@ namespace MeatKit
 
                 // Write the main assembly out into the destination folder and dispose it
                 WriteSafely(mainAssembly, Path.Combine(destinationDirectory, AssemblyRename + ".dll"));
+                IDisposable d2 = mainAssembly as IDisposable;
+                if (d2 != null) d2.Dispose();
             }
+
+            // Dispose the resolver BEFORE copying extra assemblies or calling AssetDatabase.Refresh.
+            // Cecil's DefaultAssemblyResolver caches resolved AssemblyDefinitions with open FileStreams;
+            // if we don't dispose before Refresh, Unity's AssemblyUpdater gets a sharing violation.
+            resolver.Dispose();
 
             // Then lastly copy the other assemblies to the destination folder
             foreach (var file in ExtraAssemblies)
@@ -135,6 +148,7 @@ namespace MeatKit
             // When we're done importing assemblies, let Unity refresh the asset database
             PlayerSettings.SetScriptingDefineSymbolsForGroup(BuildTargetGroup.Standalone, "H3VR_IMPORTED");
             NormalizeMetaFileGUIDs();
+            EnsureMcsRsp();
         }
 
         // Attempts to write the Cecil assembly directly to destPath.  If the destination is
@@ -154,8 +168,9 @@ namespace MeatKit
                 // Fall through to staging path.
             }
 
-            string pendingDir = Path.GetFullPath(
-                Path.Combine(Path.Combine(Path.Combine(Application.dataPath, ".."), "Library"), "PendingDllImports"));
+            string projectDir = Path.Combine(Application.dataPath, "..");
+            string pendingDir = Path.GetFullPath(Path.Combine(Path.Combine(projectDir, "Library"), "PendingDllImports"));
+
             if (!Directory.Exists(pendingDir))
                 Directory.CreateDirectory(pendingDir);
 
@@ -231,10 +246,10 @@ namespace MeatKit
 
         private static void ImportSingleAssembly(string assemblyPath, string destinationDirectory)
         {
+            var resolver = new RedirectedAssemblyResolver(Path.GetDirectoryName(assemblyPath), destinationDirectory);
             var rParams = new ReaderParameters
             {
-                AssemblyResolver =
-                    new RedirectedAssemblyResolver(Path.GetDirectoryName(assemblyPath), destinationDirectory)
+                AssemblyResolver = resolver
             };
 
             // If this assembly uses the Assembly-CSharp name at all for any reason, replace it with H3VRCode-CSharp
@@ -268,11 +283,18 @@ namespace MeatKit
             if (referencesMmhook)
             {
                 bool shouldContinue = EditorUtility.DisplayDialog("Warning", "The selected library appears to reference MMHOOK. If you don't know what this means, do not continue with the import as it will likely result in instability and crashes in your project. Ask the author of the library for a version that does not reference MMHOOK.", "Continue", "Cancel");
-                if (!shouldContinue) return;
+                if (!shouldContinue)
+                {
+                    IDisposable asmD = asm as IDisposable;
+                    if (asmD != null) asmD.Dispose();
+                    return;
+                }
             }
 
             asm.Write(Path.Combine(destinationDirectory, asm.MainModule.Name));
-            NormalizeMetaFileGUIDs();
+            IDisposable asmD2 = asm as IDisposable;
+            if (asmD2 != null) asmD2.Dispose();
+            resolver.Dispose();
         }
 
         private static void ApplyWikiHelpAttribute(AssemblyDefinition asm)
@@ -312,6 +334,13 @@ namespace MeatKit
             var hashFunction = MD5.Create();
             var replaceWith = new Regex(@"^guid: [0-9a-f]{32}$", RegexOptions.Multiline);
 
+            // Unity auto-generates .meta files with Editor: enabled: 0 (default).
+            // The compiler needs these DLLs as editor references, so fix it to enabled: 1.
+            // The pattern targets the "enabled: 0" line immediately after "Editor: Editor".
+            var editorEnabledFix = new Regex(
+                @"(Editor: Editor\s*\n\s*second:\s*\n\s*)enabled: 0",
+                RegexOptions.Multiline);
+
             foreach (var metaFile in Directory.GetFiles(ManagedDirectory, "*.meta"))
             {
                 // First we get the hash
@@ -322,6 +351,10 @@ namespace MeatKit
                 // Then we need to replace the hash in the meta file with it.
                 var metaText = File.ReadAllText(metaFile);
                 metaText = replaceWith.Replace(metaText, "guid: " + hexHash);
+
+                // Enable Editor platform so GetCompatibleWithEditorOrAnyPlatform includes the DLL.
+                metaText = editorEnabledFix.Replace(metaText, "${1}enabled: 1");
+
                 File.WriteAllText(metaFile, metaText);
             }
 
@@ -330,12 +363,52 @@ namespace MeatKit
         }
 
         /// <summary>
-        ///     Assembly resolver that redirects references to another path if not found.
+        ///     Creates or updates Assets/mcs.rsp so the C# compiler always receives -r: references
+        ///     to H3VRCode and other managed DLLs.  This is the belt-and-suspenders fallback for
+        ///     editor compilation: even if .meta platform settings are wrong, the compiler still
+        ///     finds the types.  NativeHookManager's ACSC hook cannot help because Unity's
+        ///     GetCompatibleWithEditorOrAnyPlatform filters DLLs before ACSC ever runs.
         /// </summary>
+        private static void EnsureMcsRsp()
+        {
+            string rspPath = Path.Combine(Application.dataPath, "mcs.rsp");
+            var sb = new StringBuilder();
+            sb.AppendLine("-r:Assets/Managed/" + AssemblyFirstpassRename + ".dll");
+            sb.AppendLine("-r:Assets/Managed/" + AssemblyRename + ".dll");
+
+            // Include common modding dependencies when present.
+            string[] extras = new string[] { "BepInEx.dll", "0Harmony.dll" };
+            foreach (string dll in extras)
+            {
+                if (File.Exists(Path.Combine(ManagedDirectory, dll)))
+                    sb.AppendLine("-r:Assets/Managed/" + dll);
+            }
+
+            string desired = sb.ToString();
+
+            // Only write if content differs to avoid triggering a recompile.
+            if (File.Exists(rspPath))
+            {
+                string existing = File.ReadAllText(rspPath);
+                if (existing == desired) return;
+            }
+
+            File.WriteAllText(rspPath, desired);
+            Debug.Log("[MeatKit] Created Assets/mcs.rsp with compiler references.");
+        }
         private class RedirectedAssemblyResolver : BaseAssemblyResolver
         {
             private readonly DefaultAssemblyResolver _defaultResolver = new DefaultAssemblyResolver();
             private readonly string[] _redirectPaths;
+            private bool _disposed;
+
+            public void Dispose()
+            {
+                if (_disposed) return;
+                _disposed = true;
+                IDisposable d = _defaultResolver as IDisposable;
+                if (d != null) d.Dispose();
+            }
 
             public RedirectedAssemblyResolver(params string[] redirectPath)
             {
