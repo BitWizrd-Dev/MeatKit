@@ -40,6 +40,9 @@ namespace MeatKit
             {
                 base.DrawProperty(property);
 
+                MeatKitCache.OpenFolderAfterBuild = EditorGUILayout.Toggle("Open folder after build", MeatKitCache.OpenFolderAfterBuild);
+                EditorGUILayout.Space();
+
                 // Draw the build action stuff
                 if (_profile.BuildAction == BuildAction.CopyToProfile)
                 {

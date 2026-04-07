@@ -28,6 +28,9 @@ namespace MeatKit
 
         [SerializeField]
         private string _lastUpdateCheckTime = default(DateTime).ToString(CultureInfo.InvariantCulture);
+
+        [SerializeField]
+        private bool _openFolderAfterBuild = true;
         
         private static string CacheFilePath
         {
@@ -46,7 +49,7 @@ namespace MeatKit
                     _instance = new MeatKitCache();
                     WriteCache();
                 }
-                else _instance = JsonUtility.FromJson<MeatKitCache>(File.ReadAllText(CacheFileName));
+                else _instance = JsonUtility.FromJson<MeatKitCache>(File.ReadAllText(CacheFilePath));
                 return _instance;
             }
         }
@@ -118,6 +121,16 @@ namespace MeatKit
             set
             {
                 Instance._lastUpdateCheckTime = value.ToString(CultureInfo.InvariantCulture);
+                WriteCache();
+            }
+        }
+
+        public static bool OpenFolderAfterBuild
+        {
+            get { return Instance._openFolderAfterBuild; }
+            set
+            {
+                Instance._openFolderAfterBuild = value;
                 WriteCache();
             }
         }

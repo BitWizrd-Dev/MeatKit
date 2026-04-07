@@ -85,12 +85,18 @@ public class EnumPickerWindow : EditorWindow
 
     public void ShowCustom(string enumName, List<string> values, Rect rect, Action<string> onSelect)
     {
-        _regularStyle = new GUIStyle(EditorStyles.label);
-        _regularStyle.active = _regularStyle.normal;
+        if (_regularStyle == null)
+        {
+            _regularStyle = new GUIStyle(EditorStyles.label);
+            _regularStyle.active = _regularStyle.normal;
+        }
 
-        _selectedStyle = new GUIStyle(EditorStyles.label);
-        _selectedStyle.normal = _selectedStyle.focused;
-        _selectedStyle.active = _selectedStyle.focused;
+        if (_selectedStyle == null)
+        {
+            _selectedStyle = new GUIStyle(EditorStyles.label);
+            _selectedStyle.normal = _selectedStyle.focused;
+            _selectedStyle.active = _selectedStyle.focused;
+        }
 
         _enumName = enumName;
         _valuesRaw = new List<string>(values);
@@ -128,9 +134,24 @@ public class EnumPicker : PropertyDrawer
 {
     private EnumPickerWindow _window;
 
+    // Per-type cache: avoids Enum.GetValues() + ToString() allocation every inspector frame
+    private static readonly Dictionary<Type, List<string>> _enumValueCache
+        = new Dictionary<Type, List<string>>();
+
+    private static List<string> GetEnumStrings(Type enumType)
+    {
+        List<string> cached;
+        if (_enumValueCache.TryGetValue(enumType, out cached)) return cached;
+        Array valuesRaw = Enum.GetValues(enumType);
+        cached = new List<string>(valuesRaw.Length);
+        for (int i = 0; i < valuesRaw.Length; i++)
+            cached.Add(valuesRaw.GetValue(i).ToString());
+        _enumValueCache[enumType] = cached;
+        return cached;
+    }
+
     public override void OnGUI(Rect position, SerializedProperty property, GUIContent label)
     {
-        Array valuesRaw = null;
         Type enumType = fieldInfo.FieldType;
         
         // Check if the property is an array or a list
@@ -144,16 +165,9 @@ public class EnumPicker : PropertyDrawer
             return;
         }
         
-        valuesRaw = Enum.GetValues(enumType);
-        if (valuesRaw.Length <= 0)
+        List<string> valuesStr = GetEnumStrings(enumType);
+        if (valuesStr.Count <= 0)
             return;
-        var valuesStr = new List<string>();
-        for (var i = 0; i < valuesRaw.Length; ++i)
-        {
-            object raw = valuesRaw.GetValue(i);
-            var str = raw.ToString();
-            valuesStr.Add(str);
-        }
         string enumName = enumType.Name;
         string currentName = Enum.GetName(enumType, property.intValue);
         EditorGUI.PrefixLabel(position, label);

@@ -852,7 +852,7 @@ public static class PlayHelper
             }
 
             // Build the three-level nested generic Dictionary types at runtime.
-            Type genericDic = typeof(System.Collections.Generic.Dictionary<,>);
+            Type genericDic = typeof(Dictionary<,>);
             Type d3 = genericDic.MakeGenericType(intensityType, audioEvType);
             Type d2 = genericDic.MakeGenericType(matType, d3);
             Type d1 = genericDic.MakeGenericType(impactType, d2);
@@ -935,8 +935,8 @@ public static class PlayHelper
                 BindingFlags.Public | BindingFlags.Instance);
 
             const int numSizes = 5; // one per MuzzleEffectSize: Subdued/Standard/Large/Huge/Oversize
-            var dummyPrefabs = new System.Collections.Generic.List<GameObject>(numSizes);
-            var dummyInts    = new System.Collections.Generic.List<int>(numSizes);
+            var dummyPrefabs = new List<GameObject>(numSizes);
+            var dummyInts    = new List<int>(numSizes);
             for (int s = 0; s < numSizes; s++)
             {
                 GameObject ps = new GameObject("[EditorMuzzleFX]");

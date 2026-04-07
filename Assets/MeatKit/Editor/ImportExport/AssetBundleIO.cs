@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.InteropServices;
@@ -38,11 +38,13 @@ namespace MeatKit
             ProcessingEnabledWrite = write;
         }
 
+
         public static void DisableProcessing()
         {
             ProcessingEnabledRead = false;
             ProcessingEnabledWrite = false;
         }
+
 
         /// <summary>
         /// This is a detour on some of the native Unity editor code which is part of writing data to asset bundles.
@@ -52,12 +54,15 @@ namespace MeatKit
         /// Our processing includes building a list of used scripts so we can verify the user has their exports setup
         /// properly, as well as remapping the assembly names for some scripts so that references are maintained
         /// correctly when loaded in the game.
+        ///
+        /// Note: H3VRCode-CSharp → Assembly-CSharp renaming is intentionally NOT done here any more.
+        /// Doing it in-place (temporarily patching the native memory before OrigTransferWrite) corrupts
+        /// MonoScript::m_ScriptCache via GrabScript() on the second build.  PostProcessBundles() in
+        /// Build.cs applies the rename safely after the bundle files are fully written.
         /// </summary>
         private static void OnMonoScriptTransferWrite(IntPtr monoScript, IntPtr streamedBinaryWrite)
         {
             // Guard against null/freed pointers that Unity may pass during cancel-cleanup passes.
-            // A cancelled BuildAssetBundles pass can invoke the hook with monoScript == 0 or with
-            // a pointer into already-freed memory; reading from it would be an access violation.
             if (monoScript == IntPtr.Zero)
             {
                 OrigMonoScriptTransferWrite(monoScript, streamedBinaryWrite);
@@ -87,7 +92,9 @@ namespace MeatKit
             // Prepare some debugging string
             string debug = "  " + assemblyName + " " + fullName + ": ";
 
-            // Check if we want to remap this assembly name
+            // Check if we want to remap this assembly name (Assembly-CSharp → PackageName, etc.)
+            // H3VRCode-CSharp is intentionally absent from the replaceMap; it is renamed via
+            // PostProcessBundles() binary replacement after BuildAssetBundles completes.
             string newAssemblyName;
             if (_replaceMap.TryGetValue(assemblyName, out newAssemblyName))
             {
@@ -104,21 +111,24 @@ namespace MeatKit
                     debug += "Ignored";
                 }
             }
-
-            // If it didn't exist in the replace map, check if it contains H3VRCode-CSharp. This is for MonoMod assemblies.
-            else if (assemblyName.Contains(MeatKit.AssemblyRename))
-            {
-                // Write the new assembly name into memory
-                UnityNativeHelper.WriteNativeString(monoScript, MonoScriptAssemblyName, assemblyName.Replace(MeatKit.AssemblyRename, MeatKit.AssemblyName));
-                applied = true;
-                debug += "MonoMod";
-            }
             else
             {
                 debug += "Unchanged";
             }
 
             BuildLog.WriteLine(debug);
+
+            // For H3VRCode-CSharp scripts, call RebuildFromAwake on the exact native object
+            // immediately before writing the TypeTree to the bundle.  ReprimeSilentAfterEATI
+            // re-primes managed MonoScript proxies after EATI, but the bundle serialisation
+            // path may receive DIFFERENT native C++ objects whose m_pClass was reset by EATI.
+            // Calling RebuildFromAwake here guarantees the TypeTree has the AnvilAsset fields
+            // (e.g. anvilPrefab) for every H3VRCode script that ends up in a bundle.
+            if (assemblyName != null &&
+                assemblyName.IndexOf("H3VRCode-CSharp", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                ManagedPluginDomainFix.ReprimeSingleNativeScript(monoScript);
+            }
 
             // Let the original method run
             OrigMonoScriptTransferWrite(monoScript, streamedBinaryWrite);
@@ -159,7 +169,6 @@ namespace MeatKit
                     // Write the new assembly name into memory
                     UnityNativeHelper.WriteNativeString(monoScript, MonoScriptAssemblyName, newAssemblyName);
             }
-
             // If it didn't exist in the replace map, check if it contains H3VRCode-CSharp. This is for MonoMod assemblies.
             else if (assemblyName.Contains(MeatKit.AssemblyName))
             {
@@ -183,9 +192,7 @@ namespace MeatKit
         private static readonly MonoScriptTransferRead OrigMonoScriptTransferRead;
 
         private const int MonoScriptClassName = 224;
-
         private const int MonoScriptNamespace = 272;
-
         private const int MonoScriptAssemblyName = 320;
     }
 }
