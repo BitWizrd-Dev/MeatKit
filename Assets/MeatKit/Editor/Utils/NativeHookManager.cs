@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using MonoMod.RuntimeDetour;
 using MonoMod.Utils;
@@ -55,13 +56,19 @@ namespace MeatKit
         /// <summary>True when the BuildPlayerExtractAndValidateScriptTypes native hook was successfully installed.</summary>
         internal static bool BPEVSTHookInstalled { get { return _origBPEVST != null; } }
 
-        // Decides whether to include a plugin DLL in a script compile's reference list.
-        // Hooked to force-include H3VRCode during post-build editor recompiles (when a5=1).
+        // TransferScriptingObject<GenerateTypeTreeTransfer>: clears the cached SerData (a4+136)
+        // before each call during bundle builds so the TypeTree is always regenerated fresh from
+        // the live pClass (a4+8) rather than a stale cached TypeTree loaded from Library/metadata.
+        // This fixes the Build 2 anvilPrefab regression where the editor-domain startup EATI
+        // populates cache+136 from stale metadata, and that stale cache is read by the bundle
+        // type-table writer before ReprimeSilentAfterEATI's clearing takes effect.
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        private delegate byte AssemblyCheckSkipConditionDelegate(
-            long a1, long a2, uint a3, uint a4, byte a5, byte a6, long a7);
+        private delegate void d_TransferScriptingObjectGTT(long a1, long a2, long a3, long a4);
 
-        private static AssemblyCheckSkipConditionDelegate _origACSC;
+        private static d_TransferScriptingObjectGTT _origTSOGTT;
+
+        /// <summary>True when the TransferScriptingObject&lt;GenerateTypeTreeTransfer&gt; hook is installed.</summary>
+        internal static bool TSOGTTHookInstalled { get { return _origTSOGTT != null; } }
 
         // Schedules a domain reload. Suppressed during MonoScript repair to prevent an infinite
         // reload loop (CheckConsistency → FixRuntimeScriptReference → reload → repeat).
@@ -69,6 +76,18 @@ namespace MeatKit
         private delegate void d_RequestScriptReload(IntPtr thisApp);
 
         private static d_RequestScriptReload _origRequestScriptReload;
+
+        // PluginImporter::IsCompatibleWithEditorCPUAndOS — hooked to force-return true for
+        // Assets/Managed/ DLLs whose .meta defaults to enabled:0, making them visible to the
+        // script compiler, component menus, and MonoScript::BelongsToEditorCompatibleAssembly.
+        // Signature: bool IsCompatibleWithEditorCPUAndOS(this, const string& buildTargetGroup, const string& buildTarget)
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate byte d_IsCompatibleWithEditorCPUAndOS(IntPtr thisPluginImporter, IntPtr buildTargetGroupName, IntPtr buildTargetName);
+
+        private static d_IsCompatibleWithEditorCPUAndOS _origIsCompatibleWithEditorCPUAndOS;
+
+        /// <summary>True when the IsCompatibleWithEditorCPUAndOS hook was successfully installed.</summary>
+        internal static bool IsCompatibleHookInstalled { get { return _origIsCompatibleWithEditorCPUAndOS != null; } }
 
         /// <summary>
         /// When true, the Application_RequestScriptReload hook is a no-op.
@@ -83,10 +102,25 @@ namespace MeatKit
         // The AHVTI hook only skips H3VRCode while this is true; cleared by _afterEATI.
         internal static volatile bool InsideEATI = false;
 
-        // Set true during BuildAssetBundles to block ALL Assets/Managed/ DLL processing
-        // (not just H3VRCode). Cleared after BuildAssetBundles returns so post-build
-        // standalone EATIs do NOT block other plugin DLLs the editor compiler needs.
+        // True exclusively during a MeatKit bundle build (set by Build.cs _beforeEATI, cleared after
+        // BuildAssetBundles). When set, AHVTI blocks ALL Assets/Managed/ DLLs; otherwise (standalone/
+        // startup EATI) only H3VRCode is blocked so other plugin DLLs remain available to the compiler.
         internal static volatile bool InsideBundleEATI = false;
+
+        // When true, the AHVTI hook allows ALL assemblies through (no blocking).
+        // Set by ManagedPluginDomainFix during a targeted DLL reimport to let EATI
+        // regenerate the correct TypeTree for H3VRCode without a domain reload.
+        internal static volatile bool BypassAHVTIBlock = false;
+
+        // DLL basenames (without extension) from Assets/Managed/ that AHVTI should protect from
+        // EATI during bundle builds (InsideBundleEATI=true).  Populated once at static-ctor time
+        // so the check is a simple HashSet lookup with no file I/O on each AHVTI call.
+        private static readonly HashSet<string> _managedPluginDllNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        // Native pointers (m_CachedPtr) of PluginImporter instances for DLLs in Assets/Managed/.
+        // The IsCompatibleWithEditorCPUAndOS hook uses this set to force-compatible only our DLLs,
+        // leaving Unity Extension DLLs (e.g. Standalone/UnityEngine.UI.dll) to the original check.
+        private static readonly HashSet<IntPtr> _managedPluginNativePtrs = new HashSet<IntPtr>();
 
         // Keep track of all the applied detours so we can quickly undo them before the mono domain is reloaded
         private static readonly List<NativeDetour> Detours = new List<NativeDetour>();
@@ -102,6 +136,11 @@ namespace MeatKit
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr hObject);
 
+        // ExitProcess: terminates without running CRT atexit handlers (deadlock site for Mono when
+        // NativeDetour objects have been created). Still fires DLL_PROCESS_DETACH notifications.
+        [DllImport("kernel32.dll")]
+        private static extern void ExitProcess(uint uExitCode);
+
         [DllImport("kernel32.dll")]
         private static extern uint GetCurrentThreadId();
 
@@ -111,12 +150,6 @@ namespace MeatKit
             IntPtr ThreadHandle, int ThreadInformationClass,
             out IntPtr ThreadInformation, int ThreadInformationLength, IntPtr ReturnLength);
 
-        // ExitProcess: terminates the process with DLL_PROCESS_DETACH notifications
-        // but WITHOUT running CRT atexit handlers (which is where Mono deadlocks
-        // during cleanup when NativeDetour objects have been created).
-        [DllImport("kernel32.dll")]
-        private static extern void ExitProcess(uint uExitCode);
-
         // Fired after compilation but before domain reload; only reliable window for survival code
         internal static readonly List<Action> BeforeShutdownCallbacks = new List<Action>();
 
@@ -124,10 +157,49 @@ namespace MeatKit
         {
             if (!EditorVersion.IsSupportedVersion) return;
 
-            // Check whether H3VRCode DLLs are present before installing hooks that reference them.
-            string managedDir = System.IO.Path.Combine(Application.dataPath, "Managed");
-            _h3vrCodeExists = System.IO.File.Exists(System.IO.Path.Combine(managedDir, "H3VRCode-CSharp.dll"))
-                           || System.IO.File.Exists(System.IO.Path.Combine(managedDir, "H3VRCode-CSharp-firstpass.dll"));
+            // Populate the set of managed plugin DLL names to protect from EATI.
+            // Done here (before any detour is installed) so the set is ready before
+            // the first AHVTI callback fires.
+            try
+            {
+                string managedDir = System.IO.Path.Combine(UnityEngine.Application.dataPath, "Managed");
+                if (System.IO.Directory.Exists(managedDir))
+                {
+                    foreach (string dll in System.IO.Directory.GetFiles(managedDir, "*.dll"))
+                        _managedPluginDllNames.Add(System.IO.Path.GetFileNameWithoutExtension(dll));
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("[NativeHookManager] Failed to enumerate Assets/Managed/*.dll: " + ex.Message);
+            }
+
+            // Collect native pointers for Assets/Managed/ PluginImporters so the
+            // IsCompatibleWithEditorCPUAndOS hook can selectively force-compatible only our DLLs.
+            try
+            {
+                FieldInfo cachedPtrField = typeof(UnityEngine.Object).GetField(
+                    "m_CachedPtr", BindingFlags.Instance | BindingFlags.NonPublic);
+                if (cachedPtrField != null)
+                {
+                    string managedAssetDir = "Assets/Managed";
+                    foreach (string dllName in _managedPluginDllNames)
+                    {
+                        string assetPath = managedAssetDir + "/" + dllName + ".dll";
+                        PluginImporter importer = AssetImporter.GetAtPath(assetPath) as PluginImporter;
+                        if (importer != null)
+                        {
+                            IntPtr nativePtr = (IntPtr)cachedPtrField.GetValue(importer);
+                            if (nativePtr != IntPtr.Zero)
+                                _managedPluginNativePtrs.Add(nativePtr);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("[NativeHookManager] Failed to collect managed plugin native pointers: " + ex.Message);
+            }
 
             NativeHookFunctionOffsets offsets = EditorVersion.Current.FunctionOffsets;
 
@@ -201,24 +273,6 @@ namespace MeatKit
                 }
             }
 
-            // Install Assembly_CheckSkipCondition hook.
-            // Forces H3VRCode to be included in the post-build editor recompile reference list.
-            long acscOffset = offsets.AssemblyCheckSkipCondition;
-            if (acscOffset != 0)
-            {
-                try
-                {
-                    _origACSC = ApplyEditorDetour<AssemblyCheckSkipConditionDelegate>(
-                        acscOffset,
-                        new AssemblyCheckSkipConditionDelegate(OnAssemblyCheckSkipCondition));
-                }
-                catch (Exception ex)
-                {
-                    Debug.LogWarning("[NativeHookManager] Failed to install ACSC detour. " +
-                                     "FistVR scripts will break after every build. Exception: " + ex.Message);
-                }
-            }
-
             // Install Application_RequestScriptReload hook. Suppresses reload requests during the
             // ctor-time H3VRCode MonoScript repair window to prevent an infinite domain-reload loop
             // caused by CheckConsistency firing on newly-valid H3VRCode class pointers.
@@ -238,21 +292,55 @@ namespace MeatKit
                 }
             }
 
-            // STOA hook REMOVED — permanently making mono_thread_suspend_all_other_threads a no-op
-            // prevented Unity from closing (WM_CLOSE hang: Mono's exit sequence needs STOA to
-            // actually suspend threads before teardown). The original deadlock during domain reload
-            // (caused by Mono IO-worker threads stuck in uninterruptible I/O) is now handled by
-            // TerminateMonoIOWorkers() in OnShutdownManaged, which kills those threads before
-            // OrigShutdownManaged calls into Mono's domain teardown path.
+            // Install IsCompatibleWithEditorCPUAndOS hook.
+            // Forces all PluginImporter DLLs to report as editor-compatible, fixing the
+            // .meta enabled:0 default that causes H3VRCode (and other Assets/Managed/ DLLs)
+            // to be excluded from script compilation, component menus, and MonoScript lookups.
+            long icOffset = offsets.IsCompatibleWithEditorCPUAndOS;
+            if (icOffset != 0)
+            {
+                try
+                {
+                    _origIsCompatibleWithEditorCPUAndOS = ApplyEditorDetour<d_IsCompatibleWithEditorCPUAndOS>(
+                        icOffset,
+                        new d_IsCompatibleWithEditorCPUAndOS(OnIsCompatibleWithEditorCPUAndOS));
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("[NativeHookManager] Failed to install IsCompatibleWithEditorCPUAndOS hook. " +
+                                     "Assets/Managed/ DLLs may not appear in compile references. Exception: " + ex.Message);
+                }
+            }
+
+            // Install TransferScriptingObject<GenerateTypeTreeTransfer> hook.
+            // Clears MonoScriptCache+136 (CachedSerializationData) before each bundle type-table
+            // TypeTree generation, forcing fresh TypeTree from the live pClass (MonoScriptCache+8).
+            // This prevents stale TypeTrees (from editor-startup EATI or prior builds) from being
+            // baked into the bundle, fixing the Build 2 anvilPrefab regression.
+            long tsoGttOffset = offsets.TransferScriptingObjectGTT;
+            if (tsoGttOffset != 0)
+            {
+                try
+                {
+                    _origTSOGTT = ApplyEditorDetour<d_TransferScriptingObjectGTT>(
+                        tsoGttOffset,
+                        new d_TransferScriptingObjectGTT(OnTransferScriptingObjectGTT));
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("[NativeHookManager] Failed to install TSOGTT detour. " +
+                                     "Build 2 anvilPrefab regression may persist. Exception: " + ex.Message);
+                }
+            }
+
+            // STOA hook REMOVED — permanently no-op'ing STOA hung Unity on WM_CLOSE (Mono needs it
+            // for teardown). IO-worker deadlock is fixed instead by TerminateMonoIOWorkers() below.
 
             // NOTE: PIOLA and ReloadAllUsedAssemblies hooks are not installed — both are
             // re-entrant from an [InitializeOnLoad] context and cause crashes in mono.dll.
 
-            // Register for EditorApplication.editorApplicationQuit (internal field, accessed via reflection).
-            // Creating NativeDetour objects causes Mono's CRT atexit cleanup to deadlock during exit().
-            // This callback fires inside Application::Terminate, BEFORE the deadlocking exit() call.
-            // We call ExitProcess(0) here to bypass the CRT atexit handlers entirely; this still runs
-            // DLL_PROCESS_DETACH notifications but avoids the Mono cleanup deadlock.
+            // NativeDetour objects cause Mono's CRT atexit to deadlock on exit().
+            // Hook editorApplicationQuit (fires before exit()) and call ExitProcess(0) to bypass atexit.
             RegisterQuitCallback();
         }
 
@@ -323,8 +411,9 @@ namespace MeatKit
 
         // NOTE: GetCompatibleWithEditorOrAnyPlatform hook not installed.
         // Its prologue contains RIP-relative instructions that MonoMod copies verbatim to the
-        // trampoline page, causing corrupted memory accesses. H3VRCode references are injected
-        // via Assets/mcs.rsp instead.
+        // trampoline page, causing corrupted memory accesses. The IsCompatibleWithEditorCPUAndOS
+        // hook handles H3VRCode references instead (it calls GetCompatibleWithEditorOrAnyPlatform
+        // internally, so force-returning true for our DLLs achieves the same result).
 
         // Saved thisApp pointer from the most-recently suppressed RequestScriptReload call.
         // Replayed by ManagedPluginDomainFix when suppression is lifted so that any
@@ -345,9 +434,8 @@ namespace MeatKit
         }
 
         /// <summary>
-        /// Replays a RequestScriptReload call that was suppressed while
-        /// SuppressRequestScriptReload was true.  Must be called AFTER setting
-        /// SuppressRequestScriptReload = false.  No-op if no call was suppressed.
+        /// Replays a suppressed RequestScriptReload. Call after clearing SuppressRequestScriptReload.
+        /// No-op if nothing was suppressed.
         /// </summary>
         internal static void ReplayPendingScriptReloadIfNeeded()
         {
@@ -358,44 +446,38 @@ namespace MeatKit
         }
 
         /// <summary>
-        /// Discards any pending suppressed RequestScriptReload without replaying it.
-        /// Call this after a successful MonoScript repair (RebuildFromAwake) when all
-        /// scripts are healthy — RebuildFromAwake triggers RequestScriptReload internally
-        /// as a side effect, and that internal call should NOT cause another domain reload.
+        /// Discards a pending suppressed RequestScriptReload without replaying it.
+        /// Use after RebuildFromAwake-based repairs — RebuildFromAwake triggers a reload
+        /// as a side effect that should not propagate.
         /// </summary>
         internal static void DiscardPendingScriptReload()
         {
             _suppressedReloadApp = IntPtr.Zero;
         }
 
-        // True when H3VRCode DLLs exist in Assets/Managed/ at load time.
-        // Checked by the ACSC hook so we only force-include when the DLLs are actually present.
-        // Without this guard, a project that never imported H3VRCode would get phantom references
-        // injected into the compiler, causing missing-file errors.
-        private static readonly bool _h3vrCodeExists;
-
-        // Assembly_CheckSkipCondition hook: return 0 (include) for H3VRCode paths in ALL
-        // compiles (editor AND standalone), bypassing IsCompatibleWithEditorCPUAndOS exclusion.
-        // Only activates when the DLLs actually exist on disk — if a user never imported
-        // H3VRCode, the hook falls through to the original behaviour.
-        // Unity string layout at a2: *(long*)a2==0 → small string inline at a2+8; else heap char*.
-        private static byte OnAssemblyCheckSkipCondition(long a1, long a2, uint a3, uint a4, byte a5, byte a6, long a7)
+        // During bundle builds, clear CachedSerializationData (cache+136) before each call so the
+        // TypeTree is regenerated from the live pClass — fixes the Build 2 anvilPrefab regression
+        // caused by stale TypeTrees cached from editor startup or a prior build run.
+        private static void OnTransferScriptingObjectGTT(long a1, long a2, long a3, long a4)
         {
-            if (_h3vrCodeExists && a2 != 0)
+            if (InsideBundleEATI && a4 != 0)
             {
                 try
                 {
-                    long firstWord = Marshal.ReadInt64((IntPtr)a2);
-                    IntPtr namePtr = (firstWord == 0) ? (IntPtr)(a2 + 8) : (IntPtr)firstWord;
-                    string path = Marshal.PtrToStringAnsi(namePtr);
-                    if (path != null && path.IndexOf("H3VRCode-CSharp", StringComparison.OrdinalIgnoreCase) >= 0)
-                    {
-                        return 0; // include
-                    }
+                    Marshal.WriteIntPtr((IntPtr)(a4 + 136), IntPtr.Zero);
                 }
                 catch { }
             }
-            return _origACSC(a1, a2, a3, a4, a5, a6, a7);
+            _origTSOGTT(a1, a2, a3, a4);
+        }
+
+        // Force-return true for Assets/Managed/ DLLs only. Unity Extension DLLs are passed through
+        // — forcing them causes CS1704 duplicate reference errors from platform-override variants.
+        private static byte OnIsCompatibleWithEditorCPUAndOS(IntPtr thisPluginImporter, IntPtr buildTargetGroupName, IntPtr buildTargetName)
+        {
+            if (_managedPluginNativePtrs.Contains(thisPluginImporter))
+                return 1;
+            return _origIsCompatibleWithEditorCPUAndOS(thisPluginImporter, buildTargetGroupName, buildTargetName);
         }
 
         private static byte OnBuildPlayerExtractAndValidateScriptTypes(
@@ -431,11 +513,15 @@ namespace MeatKit
             return result;
         }
 
-        // AssemblyHasValidTypeInfo hook: when InsideEATI is true, return false (0) for H3VRCode
-        // assemblies so EATI skips them and does not overwrite their Library/metadata files.
-        // Unity string layout at *a1: *(long*)a1==0 → small-string at a1+8; else heap char*.
+        // During bundle builds: return false for ALL Assets/Managed/ DLLs to prevent EATI from
+        // overwriting Library/metadata. During standalone/startup EATIs: block only H3VRCode
+        // so BepInEx/OtherLoader/Sodalite remain available to the script compiler.
+        // Unity string at *a1: *(long*)a1==0 → small-string at a1+8; else heap char*.
         private static byte OnAssemblyHasValidTypeInfo(long a1)
         {
+            if (BypassAHVTIBlock)
+                return _origAHVTI(a1);
+
             if (InsideEATI && a1 != 0)
             {
                 try
@@ -443,7 +529,7 @@ namespace MeatKit
                     long firstWord = Marshal.ReadInt64((IntPtr)a1);
                     IntPtr namePtr = (firstWord == 0) ? (IntPtr)(a1 + 8) : (IntPtr)firstWord;
                     string name = Marshal.PtrToStringAnsi(namePtr);
-                    if (name != null && name.IndexOf("H3VRCode", StringComparison.OrdinalIgnoreCase) >= 0)
+                    if (name != null && IsBlockedForCurrentEATI(name))
                     {
                         return 0; // false → EATI skips this assembly; Library/metadata unchanged
                     }
@@ -451,6 +537,29 @@ namespace MeatKit
                 catch { }
             }
             return _origAHVTI(a1);
+        }
+
+        // True when 'name' should be excluded from EATI: always H3VRCode, and during bundle builds
+        // all Assets/Managed/ DLLs to prevent TypeTree/m_pClass cache corruption.
+        private static bool IsBlockedForCurrentEATI(string name)
+        {
+            // H3VRCode is always blocked while InsideEATI is true.
+            if (name.IndexOf("H3VRCode", StringComparison.OrdinalIgnoreCase) >= 0)
+                return true;
+            // All other Assets/Managed/ DLLs are only blocked during the actual bundle build.
+            if (InsideBundleEATI)
+            {
+                string baseName = System.IO.Path.GetFileNameWithoutExtension(name);
+                if (!string.IsNullOrEmpty(baseName) && _managedPluginDllNames.Contains(baseName))
+                    return true;
+                // Block user assemblies too — Build 1's stub H3VRCode leaves stale TypeTrees in
+                // Library/metadata for Assembly-CSharp types inheriting AnvilAsset (Build 2 regression).
+                if (baseName != null && (
+                    baseName.Equals("Assembly-CSharp", StringComparison.OrdinalIgnoreCase) ||
+                    baseName.Equals("Assembly-CSharp-firstpass", StringComparison.OrdinalIgnoreCase)))
+                    return true;
+            }
+            return false;
         }
 
         private static void OnShutdownManaged()
@@ -468,7 +577,10 @@ namespace MeatKit
             }
             finally
             {
-                // Do NOT dispose _stoaDetourInstance -- the STOA hook must live until process exit.
+                // Kill Mono IO-worker threads before teardown — they block in uninterruptible I/O
+                // waits, causing STOA to deadlock during domain unload.
+                TerminateMonoIOWorkers();
+
                 try
                 {
                     OrigShutdownManaged();
@@ -480,20 +592,23 @@ namespace MeatKit
             }
         }
 
-
-
-        // Returns true if any thread whose Win32 start address lies within mono.dll is running.
-        // This indicates the Mono socket IO-worker is active and will block STOA indefinitely.
-        private static bool MonoIOWorkerExists()
+        // Terminates all threads whose Win32 start address lies within mono.dll.
+        // These are Mono's internal IO-worker threads that can block in uninterruptible I/O waits.
+        // If they're alive when mono_thread_suspend_all_other_threads runs during domain unload,
+        // STOA deadlocks because it can't suspend them.  Killing them lets STOA succeed naturally.
+        // Safe to call before domain teardown: the domain is about to be unloaded anyway, so
+        // thread-held Mono locks become irrelevant.
+        private static void TerminateMonoIOWorkers()
         {
             try
             {
                 IntPtr monoBase = DynDll.OpenLibrary("mono.dll");
-                if (monoBase == IntPtr.Zero) return false;
+                if (monoBase == IntPtr.Zero) return;
                 long monoStart = monoBase.ToInt64();
                 long monoEnd   = monoStart + 16L * 1024 * 1024;
 
                 uint selfTid = GetCurrentThreadId();
+                const uint THREAD_TERMINATE = 0x0001;
                 const uint THREAD_QUERY_INFORMATION = 0x0040;
                 const int  ThreadQuerySetWin32StartAddress = 9;
 
@@ -501,7 +616,7 @@ namespace MeatKit
                          System.Diagnostics.Process.GetCurrentProcess().Threads)
                 {
                     if ((uint)pt.Id == selfTid) continue;
-                    IntPtr hThread = OpenThread(THREAD_QUERY_INFORMATION, false, (uint)pt.Id);
+                    IntPtr hThread = OpenThread(THREAD_TERMINATE | THREAD_QUERY_INFORMATION, false, (uint)pt.Id);
                     if (hThread == IntPtr.Zero) continue;
                     try
                     {
@@ -515,9 +630,9 @@ namespace MeatKit
                             if (addr >= monoStart && addr < monoEnd)
                             {
                                 Debug.Log(string.Format(
-                                    "[NativeHookManager] Mono IO-worker detected (TID 0x{0:X}); STOA will be suppressed",
+                                    "[NativeHookManager] Terminating Mono IO-worker (TID 0x{0:X}) before domain teardown",
                                     pt.Id));
-                                return true;
+                                TerminateThread(hThread, 0);
                             }
                         }
                     }
@@ -529,9 +644,8 @@ namespace MeatKit
             }
             catch (Exception ex)
             {
-                Debug.LogWarning("[NativeHookManager] MonoIOWorkerExists failed: " + ex.Message);
+                Debug.LogWarning("[NativeHookManager] TerminateMonoIOWorkers failed: " + ex.Message);
             }
-            return false;
         }
     }
 }

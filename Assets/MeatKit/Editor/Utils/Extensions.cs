@@ -35,26 +35,18 @@ namespace MeatKit
         // Modified version of http://answers.unity.com/answers/1425776/view.html
         public static T[] GetAllInstances<T>() where T : ScriptableObject
         {
-            string[] guids = AssetDatabase.FindAssets("t:" + typeof(T).FullName);
-            var result = new T[guids.Length];
-            for (int i = 0; i < guids.Length; i++)
-            {
-                string path = AssetDatabase.GUIDToAssetPath(guids[i]);
-                result[i] = AssetDatabase.LoadAssetAtPath<T>(path);
-            }
-            return result;
+            return AssetDatabase.FindAssets("t:" + typeof(T).FullName)
+                .Select(AssetDatabase.GUIDToAssetPath)
+                .Select(AssetDatabase.LoadAssetAtPath<T>)
+                .ToArray();
         }
 
         public static Object[] GetAllInstances(Type t)
         {
-            string[] guids = AssetDatabase.FindAssets("t:" + t.FullName);
-            var result = new Object[guids.Length];
-            for (int i = 0; i < guids.Length; i++)
-            {
-                string path = AssetDatabase.GUIDToAssetPath(guids[i]);
-                result[i] = AssetDatabase.LoadAssetAtPath(path, t);
-            }
-            return result;
+            return AssetDatabase.FindAssets("t:" + t.FullName)
+                .Select(AssetDatabase.GUIDToAssetPath)
+                .Select(p => AssetDatabase.LoadAssetAtPath(p, t))
+                .ToArray();
         }
 
         // https://stackoverflow.com/a/25223884
