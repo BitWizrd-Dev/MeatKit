@@ -15,9 +15,12 @@ namespace MeatKit
         public long ExtractAssemblyTypeInfoAll { get; set; }
         public long AssemblyHasValidTypeInfo { get; set; }
         public long BuildPlayerExtractAndValidateScriptTypes { get; set; }
-        public long AssemblyCheckSkipCondition { get; set; }
         public long RequestScriptReload { get; set; }
         public long MonoThreadSuspendAllOtherThreads { get; set; }
+        public long TransferScriptingObjectGTT { get; set; }
+        public long RenewMonoScriptsFromAssemblies { get; set; }
+        public long ReleaseMonoScriptCaches { get; set; }
+        public long IsCompatibleWithEditorCPUAndOS { get; set; }
     }
 
     public class EditorVersion
@@ -81,9 +84,12 @@ namespace MeatKit
                         ExtractAssemblyTypeInfoAll = 0x2BAAD0,
                         AssemblyHasValidTypeInfo = 0x1233CB0,
                         BuildPlayerExtractAndValidateScriptTypes = 0x2BD9A0,
-                        AssemblyCheckSkipCondition = 0x1B7570,
                         RequestScriptReload = 0x1741A30,
-                        MonoThreadSuspendAllOtherThreads = 0xA51C0
+                        MonoThreadSuspendAllOtherThreads = 0xA51C0,
+                        TransferScriptingObjectGTT = 0xE4CA80,
+                        RenewMonoScriptsFromAssemblies = 0x14C6910,
+                        ReleaseMonoScriptCaches = 0x14C66F0,
+                        IsCompatibleWithEditorCPUAndOS = 0x1601D10
                     }
                 }
             },

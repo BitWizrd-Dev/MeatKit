@@ -396,6 +396,7 @@ namespace MeatKit
             File.WriteAllText(rspPath, desired);
             Debug.Log("[MeatKit] Created Assets/mcs.rsp with compiler references.");
         }
+
         private class RedirectedAssemblyResolver : BaseAssemblyResolver
         {
             private readonly DefaultAssemblyResolver _defaultResolver = new DefaultAssemblyResolver();
