@@ -55,10 +55,11 @@ namespace MeatKit
         /// properly, as well as remapping the assembly names for some scripts so that references are maintained
         /// correctly when loaded in the game.
         ///
-        /// Note: H3VRCode-CSharp → Assembly-CSharp renaming is intentionally NOT done here any more.
-        /// Doing it in-place (temporarily patching the native memory before OrigTransferWrite) corrupts
-        /// MonoScript::m_ScriptCache via GrabScript() on the second build.  PostProcessBundles() in
-        /// Build.cs applies the rename safely after the bundle files are fully written.
+        /// Note: H3VRCode-CSharp → Assembly-CSharp IS now handled here (added to the replaceMap in
+        /// Build.cs).  The restore step at the end of this function writes the original name back after
+        /// OrigTransferWrite, preventing the GrabScript() cache corruption that affected earlier versions.
+        /// PostProcessBundles() in Build.cs is kept as a fallback for any occurrence that slips through
+        /// (e.g. a very small bundle whose type-tree block happens not to go through this hook).
         /// </summary>
         private static void OnMonoScriptTransferWrite(IntPtr monoScript, IntPtr streamedBinaryWrite)
         {
@@ -92,9 +93,16 @@ namespace MeatKit
             // Prepare some debugging string
             string debug = "  " + assemblyName + " " + fullName + ": ";
 
-            // Check if we want to remap this assembly name (Assembly-CSharp → PackageName, etc.)
-            // H3VRCode-CSharp is intentionally absent from the replaceMap; it is renamed via
-            // PostProcessBundles() binary replacement after BuildAssetBundles completes.
+            // Call RebuildFromAwake BEFORE any assembly name rename.
+            // RebuildFromAwake looks up the MonoClass by the current assemblyName in native memory;
+            // if the name has already been replaced (e.g. "HuntChokeBomb.dll"), the lookup fails
+            // and returns pClass=0x0, losing the TypeTree.  Calling RSN here (with "Assembly-CSharp.dll"
+            // still in place) lets RBA correctly resolve ChokeBomb → AnvilAsset → anvilPrefab.
+            ManagedPluginDomainFix.ReprimeSingleNativeScript(monoScript);
+
+            // Check if we want to remap this assembly name (Assembly-CSharp → PackageName, etc.
+            // or H3VRCode-CSharp → Assembly-CSharp).  All entries are in the replaceMap; see
+            // Build.cs for the full map.  The name is restored after OrigTransferWrite below.
             string newAssemblyName;
             if (_replaceMap.TryGetValue(assemblyName, out newAssemblyName))
             {
@@ -111,24 +119,22 @@ namespace MeatKit
                     debug += "Ignored";
                 }
             }
+            // If it didn't exist in the replace map, check if it contains H3VRCode-CSharp.
+            // This catches MonoMod assemblies like MMHOOK-H3VRCode-CSharp.dll that aren't exact
+            // replaceMap keys.  Matches upstream MeatKit behaviour.
+            else if (assemblyName.Contains(MeatKit.AssemblyRename))
+            {
+                UnityNativeHelper.WriteNativeString(monoScript, MonoScriptAssemblyName,
+                    assemblyName.Replace(MeatKit.AssemblyRename, MeatKit.AssemblyName));
+                applied = true;
+                debug += "MonoMod";
+            }
             else
             {
                 debug += "Unchanged";
             }
 
             BuildLog.WriteLine(debug);
-
-            // For H3VRCode-CSharp scripts, call RebuildFromAwake on the exact native object
-            // immediately before writing the TypeTree to the bundle.  ReprimeSilentAfterEATI
-            // re-primes managed MonoScript proxies after EATI, but the bundle serialisation
-            // path may receive DIFFERENT native C++ objects whose m_pClass was reset by EATI.
-            // Calling RebuildFromAwake here guarantees the TypeTree has the AnvilAsset fields
-            // (e.g. anvilPrefab) for every H3VRCode script that ends up in a bundle.
-            if (assemblyName != null &&
-                assemblyName.IndexOf("H3VRCode-CSharp", StringComparison.OrdinalIgnoreCase) >= 0)
-            {
-                ManagedPluginDomainFix.ReprimeSingleNativeScript(monoScript);
-            }
 
             // Let the original method run
             OrigMonoScriptTransferWrite(monoScript, streamedBinaryWrite);

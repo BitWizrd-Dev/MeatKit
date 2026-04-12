@@ -112,11 +112,19 @@ namespace MeatKit
             bool wasVirtualRealitySupported = PlayerSettings.virtualRealitySupported;
             PlayerSettings.virtualRealitySupported = true;
 
-            // Assembly rename map — H3VRCode is handled by PostProcessBundles() instead
+            // Assembly rename map.
+            // H3VRCode-CSharp → Assembly-CSharp is included here so the rename happens during
+            // MonoScriptTransferWrite (before LZ4 compression), ensuring it is visible even when
+            // the type-tree ends up inside a compressed LZ4 block where PostProcessBundles'
+            // byte-search cannot reach it.  The OnMonoScriptTransferWrite hook restores the
+            // original name after OrigTransferWrite, so in-memory state stays correct for
+            // subsequent builds.
             var replaceMap = new Dictionary<string, string>
             {
                 {AssemblyName + ".dll", profile.PackageName + ".dll"},
-                {AssemblyFirstpassName + ".dll", profile.PackageName + "-firstpass.dll"}
+                {AssemblyFirstpassName + ".dll", profile.PackageName + "-firstpass.dll"},
+                {AssemblyRename + ".dll", AssemblyName + ".dll"},
+                {AssemblyFirstpassRename + ".dll", AssemblyFirstpassName + ".dll"}
             };
             BuildLog.WriteLine("Enabling bundle processing.");
             BuildLog.WriteLine("Replace map:");
