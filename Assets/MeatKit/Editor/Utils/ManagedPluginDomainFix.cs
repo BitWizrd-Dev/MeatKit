@@ -24,11 +24,11 @@ namespace MeatKit
         private static readonly string _unityExtensionsDir;
         private static readonly string _pendingManifestPath;
 
-        // Cached reflection â€” resolved once, valid for AppDomain lifetime.
+        // Cached reflection — resolved once, valid for AppDomain lifetime.
         private static readonly FieldInfo _cachedPtrField = typeof(UnityEngine.Object).GetField(
             "m_CachedPtr", BindingFlags.NonPublic | BindingFlags.Instance);
 
-        // Cached module handles â€” resolved lazily, valid for process lifetime.
+        // Cached module handles — resolved lazily, valid for process lifetime.
         private static IntPtr _monoModule;
         private static IntPtr _unityModule;
         private static IntPtr GetMonoModule()
@@ -125,7 +125,7 @@ namespace MeatKit
             }
             else
             {
-                Debug.LogWarning("[ManagedPluginDomainFix] RequestScriptReload hook not installed â€” falling back to delayCall repair");
+                Debug.LogWarning("[ManagedPluginDomainFix] RequestScriptReload hook not installed — falling back to delayCall repair");
                 EditorApplication.delayCall += delegate 
                 { 
                     RepairH3VRCodeMonoScripts("delayCall");
@@ -941,7 +941,7 @@ namespace MeatKit
                 }
 
                 Debug.LogWarning(string.Format(
-                    "[ManagedPluginDomainFix] RepairH3VRCodeMonoScripts({2}): {0}/{1} H3VRCode scripts null â€” rebuilding ALL {1} scripts (stale m_pClass fix)",
+                    "[ManagedPluginDomainFix] RepairH3VRCodeMonoScripts({2}): {0}/{1} H3VRCode scripts null — rebuilding ALL {1} scripts (stale m_pClass fix)",
                     broken, total, caller));
 
                 IntPtr unityBase = GetModuleHandle("Unity.exe");
@@ -1004,7 +1004,7 @@ namespace MeatKit
                     string mainPath = "Assets/Managed/" + h3vr;
                     string fpPath   = "Assets/Managed/" + h3vrFp;
                     Debug.LogWarning(string.Format(
-                        "[ManagedPluginDomainFix] RepairH3VRCodeMonoScripts({0}): {1} scripts still null â€” scheduling force reimport to restore inspector",
+                        "[ManagedPluginDomainFix] RepairH3VRCodeMonoScripts({0}): {1} scripts still null — scheduling force reimport to restore inspector",
                         caller, stillBroken));
                     EditorApplication.delayCall += delegate
                     {
