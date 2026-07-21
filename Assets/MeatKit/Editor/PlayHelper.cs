@@ -461,21 +461,6 @@ public static class PlayHelper
             Type magType = ResolveFromH3VR("FistVR.FVRFireArmMagazine");
             if (magType != null)
                 PatchAwakeWithSwallow(magType);
-
-            // Project script types that NPE on serialized refs stripped by a MeatKit build.
-            Type alofsType = ResolveFromProjectAssembly("BitWizrd.Alamo.AlofsDevice");
-            if (alofsType != null)
-            {
-                HarmonyMethod swallow = new HarmonyMethod(
-                    typeof(PlayHelper).GetMethod("SwallowException",
-                        BindingFlags.Static | BindingFlags.NonPublic));
-                MethodInfo alofsStart  = AccessTools.Method(alofsType, "Start");
-                MethodInfo alofsFU    = AccessTools.Method(alofsType, "FixedUpdate");
-                MethodInfo alofsUpd   = AccessTools.Method(alofsType, "Update");
-                if (alofsStart != null) { _harmony.Patch(alofsStart, finalizer: swallow); Log("Finalizer-patched AlofsDevice.Start."); }
-                if (alofsFU   != null) { _harmony.Patch(alofsFU,    finalizer: swallow); Log("Finalizer-patched AlofsDevice.FixedUpdate."); }
-                if (alofsUpd  != null) { _harmony.Patch(alofsUpd,   finalizer: swallow); Log("Finalizer-patched AlofsDevice.Update."); }
-            }
         }
         catch (Exception ex)
         {
