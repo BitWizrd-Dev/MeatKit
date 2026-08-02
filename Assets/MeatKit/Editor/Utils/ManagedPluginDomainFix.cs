@@ -16,7 +16,7 @@ namespace MeatKit
     [InitializeOnLoad]
     static class ManagedPluginDomainFix
     {
-        private const bool DebugLogging = false;
+        private static readonly bool DebugLogging = false;
 
         private static void Log(string msg) { if (DebugLogging) UnityEngine.Debug.Log("[ManagedPluginDomainFix] " + msg); }
 
@@ -163,9 +163,6 @@ namespace MeatKit
 
         // True from EndReloadAssembly step 5 until RepairBrokenMonoScriptClasses completes at OnDomainLoad.
         private static volatile bool _insideReload = false;
-
-        // True after the first OnDomainLoad completes (boot fully settled).
-        private static volatile bool BootCompleted = false;
 
         // Re-runs the engine's step-5 MonoScript renewal (RenewMonoScriptsFromAssemblies) at OnDomainLoad,
         // after step 6 has loaded H3VRCode. Step 5 runs before H3VRCode is in MonoManager, leaving H3VRCode
@@ -658,7 +655,6 @@ namespace MeatKit
             try
             {
                 RepairBrokenMonoScriptClasses();
-                BootCompleted = true;
                 EditorApplication.delayCall += delegate
                 {
                     try { RepairBrokenMonoScriptClasses(); }
