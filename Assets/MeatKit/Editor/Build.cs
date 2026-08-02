@@ -172,11 +172,6 @@ namespace MeatKit
                 ManagedPluginDomainFix.ReprimeSilentAfterEATI();
             };
 
-            // Prime TypeTrees before registering EATI hooks to avoid SaveAssets() race
-            ManagedPluginDomainFix.PrimeTypeTreesForBuild();
-
-
-
             NativeHookManager.BeforeEATICallbacks.Add(_beforeEATI);
             NativeHookManager.AfterEATICallbacks.Add(_afterEATI);
 
@@ -189,7 +184,10 @@ namespace MeatKit
             // Unregister EATI callbacks
             NativeHookManager.BeforeEATICallbacks.Remove(_beforeEATI);
             NativeHookManager.AfterEATICallbacks.Remove(_afterEATI);
-            // Keep InsideEATI=true so post-build EATI can't overwrite H3VRCode TypeTree
+            // InsideEATI must be reset on every exit path, including success — the flag it gates
+            // (IsFileCreated) has many unrelated callers, so leaving it true would keep blocking
+            // H3VRCode for the rest of the process.
+            NativeHookManager.InsideEATI = false;
             // Clear InsideBundleEATI so post-build EATI doesn't block BepInEx/OtherLoader
             NativeHookManager.InsideBundleEATI = false;
 

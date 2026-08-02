@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using MonoMod.Utils;
 using UnityEditor;
 using UnityEditorInternal;
 using UnityEngine;
@@ -16,21 +17,16 @@ namespace MeatKit
     static class ManagedPluginDomainFix
     {
         private const bool DebugLogging = false;
-        private const string H3VRCodeReimportFlagKey = "ManagedPluginDomainFix_H3VRReimportDone";
 
+        private static void Log(string msg) { if (DebugLogging) UnityEngine.Debug.Log("[ManagedPluginDomainFix] " + msg); }
 
         private static readonly string _managedDir;
         private static readonly string _scriptAssembliesDir;
         private static readonly string _unityExtensionsDir;
         private static readonly string _pendingManifestPath;
 
-        // Cached reflection — resolved once, valid for AppDomain lifetime.
-        private static readonly FieldInfo _cachedPtrField = typeof(UnityEngine.Object).GetField(
-            "m_CachedPtr", BindingFlags.NonPublic | BindingFlags.Instance);
-
         // Cached module handles — resolved lazily, valid for process lifetime.
         private static IntPtr _monoModule;
-        private static IntPtr _unityModule;
         private static IntPtr GetMonoModule()
         {
             if (_monoModule == IntPtr.Zero)
@@ -41,16 +37,6 @@ namespace MeatKit
             return _monoModule;
         }
 
-        private static IntPtr GetUnityModule()
-        {
-            if (_unityModule == IntPtr.Zero)
-            {
-                _unityModule = GetModuleHandle("Unity");
-                if (_unityModule == IntPtr.Zero) _unityModule = GetModuleHandle("Unity.exe");
-            }
-            return _unityModule;
-        }
-        
         static ManagedPluginDomainFix()
         {
             _managedDir = Path.Combine(Application.dataPath, "Managed");
@@ -65,76 +51,9 @@ namespace MeatKit
             AppDomain.CurrentDomain.AssemblyResolve += ResolveUnityExtensionAssembly;
             CopyH3VRCodeDlls(true);
             NativeHookManager.BeforeShutdownCallbacks.Add(delegate { CopyH3VRCodeDlls(false); });
+            InstallDomainFixHooks();
 
-            // Note: PIOLA and RUA hooks cannot be installed safely from an [InitializeOnLoad]
-            // static ctor. ShutdownManaged + BeforeEATI callbacks cover all required work.
-
-            // Suppress RequestScriptReload — CheckConsistency triggers it via
-            // FixRuntimeScriptReference after [InitializeOnLoad] returns, causing infinite reload.
-            if (NativeHookManager.RequestScriptReloadHookInstalled)
-            {
-                NativeHookManager.SuppressRequestScriptReload = true;
-                RepairH3VRCodeMonoScripts("ctor");
-
-                // Apply the serialization gate patch as early as possible.
-                // This is a process-lifetime code section patch — no domain dependencies.
-                // Once applied, ALL CSD rebuilds correctly include custom struct fields
-                // (e.g. Anvil.AssetID on m_anvilPrefab) regardless of MonoManager state.
-                PatchMonoManagerScriptImages();
-                ClearH3VRSerializationCaches();
-
-                EditorApplication.delayCall += delegate
-                {
-                    EnsureH3VRCodeInScriptAssemblies();
-
-                    // CSD may have been lazily rebuilt between ctor and this delayCall.
-                    // Clear to force fresh rebuild with gate patch active.
-                    ClearH3VRSerializationCaches();
-
-                    // Reimport .object.asset files so the Library cache reflects the
-                    // correct TypeTree (with AnvilAsset fields).
-                    RepairStaleObjectAssetCache();
-
-                    // Verify MonoScripts are healthy after either Renew or fallback repair.
-                    try
-                    {
-                        if (EditorVersion.IsSupportedVersion)
-                        {
-                            string vh3vr = MeatKit.AssemblyRename + ".dll", vh3vrFp = MeatKit.AssemblyFirstpassRename + ".dll";
-                            int vTotal = 0, vBroken = 0;
-                            foreach (MonoScript vs in MonoImporter.GetAllRuntimeMonoScripts())
-                            {
-                                if ((UnityEngine.Object)vs == null) continue;
-                                string vf = Path.GetFileName(AssetDatabase.GetAssetPath(vs));
-                                if (vf != vh3vr && vf != vh3vrFp) continue;
-                                vTotal++;
-                                if (vs.GetClass() == null) vBroken++;
-                            }
-                            if (vBroken > 0)
-                                Debug.LogWarning(string.Format("[ManagedPluginDomainFix] Verify: {0}/{1} scripts STILL null after ctor repair", vBroken, vTotal));
-                            else
-                                Log("Verify: all " + vTotal + " scripts healthy");
-                        }
-                    }
-                    catch (Exception vex) { Debug.LogWarning("[ManagedPluginDomainFix] Verify: " + vex); }
-
-                    EditorPrefs.DeleteKey(H3VRCodeReimportFlagKey);
-                    NativeHookManager.SuppressRequestScriptReload = false;
-                    NativeHookManager.DiscardPendingScriptReload();
-                };
-            }
-            else
-            {
-                Debug.LogWarning("[ManagedPluginDomainFix] RequestScriptReload hook not installed — falling back to delayCall repair");
-                EditorApplication.delayCall += delegate 
-                { 
-                    RepairH3VRCodeMonoScripts("delayCall");
-                    PatchMonoManagerScriptImages();
-                    ClearH3VRSerializationCaches();
-                    EnsureH3VRCodeInScriptAssemblies();
-                    RepairStaleObjectAssetCache();
-                };
-            }
+            EditorApplication.delayCall += OnDomainLoad;
         }
 
         [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Ansi)]
@@ -143,6 +62,614 @@ namespace MeatKit
         private static extern IntPtr GetProcAddress(IntPtr hModule, string lpProcName);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate void d_mono_set_assemblies_path([MarshalAs(UnmanagedType.LPStr)] string path);
+
+        // GetMonoManagerPtr() -> MonoManager* — RVA 0x14C2510.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr d_GetMonoManagerPtr();
+
+        // MonoManager::RenewMonoScriptsFromAssemblies(MonoManager*, int* mbInstanceIDs, int mbCount)
+        // — RVA 0x14C6910. EndReloadAssembly step 5 renewal; re-run at OnDomainLoad once H3VRCode is
+        // loaded. mbList is a 32-byte buffer whose [0x18] qword is the MB count (0 = no MB rebuild).
+        [UnmanagedFunctionPointer(CallingConvention.ThisCall)]
+        private delegate void d_RenewMonoScriptsFromAssemblies(IntPtr monoManager, IntPtr mbList);
+
+        // MonoScript::GetClass(MonoScript*, ScriptingClassPtr* resultOut). Returns the class ptr
+        // from MonoScriptCache+8 (or NULL when ClassNotFound). Guarded to return 0 for garbage classes.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr d_GetClass(IntPtr monoScript, IntPtr resultOut);
+
+        private static d_GetClass _origGetClass;
+
+        /// <summary>True when the MonoScript::GetClass hook is installed.</summary>
+        internal static bool GetClassHookInstalled { get { return _origGetClass != null; } }
+
+        // MonoBehaviour::GetClass(MonoBehaviour*, ScriptingClassPtr* resultOut) — RVA 0x14BC7B0.
+        // Returns *(MB+160 cache)+8. Guarded to return 0 when that class is a stale/freed old-domain
+        // pointer, which would crash reload step 7 and the Inspector.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr d_MonoBehaviourGetClass(IntPtr thisMB, IntPtr resultOut);
+
+        private static d_MonoBehaviourGetClass _origMonoBehaviourGetClass;
+
+        // MonoBehaviour::CallMethodInactive(MonoBehaviour*, ScriptingMethodPtr*) -> bool — RVA 0x14BC9E0.
+        // Reload step 8 fires it per MB. Guarded to return true (skip invoke) when MB+160's class is
+        // a stale/freed old-domain pointer.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate byte d_CallMethodInactive(IntPtr thisMB, IntPtr methodPtr);
+
+        private static d_CallMethodInactive _origCallMethodInactive;
+
+        // SerializedProperty.objectReferenceValue icall — RVA 0x1386D30. Returns the field-value
+        // wrapper; guarded to return NULL for stale wrappers (see OnObjectReferenceValue).
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr d_ObjectReferenceValue(IntPtr prop);
+        private static d_ObjectReferenceValue _origObjectReferenceValue;
+
+        // BuildSerializationCacheFor(ScriptingClassPtr, bool*) -> CachedSerializationData* — RVA 0xE4BD30.
+        // Lazy-builds the serialization command queue for a class; guarded against stale/garbage classes.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr d_BuildSerializationCacheFor(IntPtr classPtr, IntPtr createFlags);
+
+        private static d_BuildSerializationCacheFor _origBuildSerializationCacheFor;
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void MonoScriptRenewDelegate(long pMonoScript, long classPtr);
+
+        private static MonoScriptRenewDelegate _origMonoScriptRenew;
+
+        // MonoManager::GetMonoClassWithAssemblyName(MonoManager*, className*, namespace*, assemblyName*)
+        // -> MonoClass* — RVA 0x14C32E0. Returns 0 for H3VRCode during EndReloadAssembly step 5 (H3VRCode
+        // isn't in MonoManager's image table yet). Fallback resolves the class from the H3VRCode image so
+        // step 5's MonoScript_Renew gets a real cache (see OnGetMonoClassWithAssemblyName).
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate long d_GetMonoClassWithAssemblyName(IntPtr monoManager, IntPtr classNameStr, IntPtr namespaceStr, IntPtr assemblyNameStr);
+
+        private static d_GetMonoClassWithAssemblyName _origGetMonoClassWithAssemblyName;
+
+        // Native MonoScript / MonoScriptCache offsets (Unity 5.6.7f1 x64, IDA-verified).
+        private const int MonoScriptCacheOffset = 216; // MonoScript::m_ScriptCache
+        private const int CacheClassOffset      = 8;   // MonoScriptCache::m_pClass
+
+        // ReprimeMBCachesBeforeEATI / ReprimeSilentAfterEATI (restored from MeatKit-main) are
+        // deliberately no-ops: their reflection (FindObjectsOfTypeAll + GetValue) hard-faults on the
+        // post-build corrupt MonoScript state. Cache repair is handled by RepairBrokenMonoScriptClasses.
+        internal static void ReprimeMBCachesBeforeEATI()
+        {
+            return;
+        }
+
+        internal static void ReprimeSilentAfterEATI()
+        {
+            return;
+        }
+
+        // --- CheckTypeSerializable gate byte patch ---
+        // RVA in MonoManager_CheckTypeSerializable where GetAssemblyIndexFromImage result is checked.
+        // Patch: cmp eax,-1; setnz al -> mov al,1; nop; nop; nop; nop  (always returns true for non-corlib types).
+        private const long RVA_GatePatchSite = 0xE3F6D5;
+        private static readonly byte[] GateOrigBytes = new byte[] { 0x83, 0xF8, 0xFF, 0x0F, 0x95, 0xC0 };
+        private static readonly byte[] GatePatchBytes = new byte[] { 0xB0, 0x01, 0x90, 0x90, 0x90, 0x90 };
+        private static bool _gatePatchApplied = false;
+
+        // --- SetupScriptingCache early-exit NOP patch ---
+        // MonoBehaviour::SetupScriptingCache (RVA 0x14BE350) sets MB+160 from the MonoScript's
+        // MonoScriptCache+8 class. An early-exit (jnz at RVA 0x14BE38F) skips the rebuild when
+        // MB+160 is non-zero, keeping a STALE cache from the old domain. NOP-ing the jnz forces
+        // MB+160 to always rebuild from the current MonoScript+216 cache.
+        private const long RVA_SetupScriptingCacheEarlyExit = 0x14BE38F;
+        private static readonly byte[] SSCacheOrigBytes = new byte[] { 0x0F, 0x85, 0x42, 0x02, 0x00, 0x00 };
+        private static readonly byte[] SSCachePatchBytes = new byte[] { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+        private static bool _ssCachePatchApplied = false;
+
+        // True from EndReloadAssembly step 5 until RepairBrokenMonoScriptClasses completes at OnDomainLoad.
+        private static volatile bool _insideReload = false;
+
+        // True after the first OnDomainLoad completes (boot fully settled).
+        private static volatile bool BootCompleted = false;
+
+        // Re-runs the engine's step-5 MonoScript renewal (RenewMonoScriptsFromAssemblies) at OnDomainLoad,
+        // after step 6 has loaded H3VRCode. Step 5 runs before H3VRCode is in MonoManager, leaving H3VRCode
+        // MonoScript caches null/ClassNotFound (or corrupted to &mono!builtin_types[0]), which crashes the
+        // Inspector. Re-running against the now-loaded H3VRCode restores every cache+8.
+        internal static void RepairBrokenMonoScriptClasses()
+        {
+            try
+            {
+                var getMonoManagerFn = (d_GetMonoManagerPtr)NativeHookManager.GetDelegateForFunctionPointer<d_GetMonoManagerPtr>(0x14C2510);
+                var renewFn = (d_RenewMonoScriptsFromAssemblies)NativeHookManager.GetDelegateForFunctionPointer<d_RenewMonoScriptsFromAssemblies>(0x14C6910);
+                if (getMonoManagerFn == null || renewFn == null)
+                {
+                    Debug.LogError("[ManagedPluginDomainFix] RepairBrokenMonoScriptClasses: failed to resolve native functions");
+                    return;
+                }
+
+                IntPtr monoManager = getMonoManagerFn();
+                if (monoManager == IntPtr.Zero)
+                {
+                    Debug.LogError("[ManagedPluginDomainFix] RepairBrokenMonoScriptClasses: MonoManager is NULL");
+                    return;
+                }
+
+                // Renew can fire RequestScriptReload (infinite reload loop); suppress during the pass.
+                bool wasSuppressing = NativeHookManager.SuppressRequestScriptReload;
+                NativeHookManager.SuppressRequestScriptReload = true;
+                try
+                {
+                    // The full RenewMonoScriptsFromAssemblies re-run is disabled (Renew asserts on valid
+                    // caches -> log flood); MonoScript caches are fixed by RepairSceneMonoScriptClasses.
+                    // The reload window (steps 5-8) is over; allow the on-demand GetClass repair again.
+                    _insideReload = false;
+                    // Repairs scene-referenced m_Script MonoScripts whose cache+8 is ClassNotFound
+                    // (fixes the Inspector NRE/ATE and the step-7/8 reload crash).
+                    try { RepairSceneMonoScriptClasses(); }
+                    catch (Exception ex3) { Debug.LogWarning("[ManagedPluginDomainFix] RepairSceneMonoScriptClasses: " + ex3.Message); }
+
+                    // MB instance rebuilds are disabled: RebuildMonoInstance() destroys the managed
+                    // instance, breaking the following build. The GetClass guards fix the Inspector crash.
+                }
+                finally
+                {
+                    NativeHookManager.SuppressRequestScriptReload = wasSuppressing;
+                    if (!wasSuppressing)
+                        NativeHookManager.DiscardPendingScriptReload(); // keep the repaired state; no reload loop
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError("[ManagedPluginDomainFix] RepairBrokenMonoScriptClasses failed: " + ex);
+            }
+        }
+
+
+        // Heuristic: is this pointer obviously not a live MonoClass? Pure memory reads, no deref.
+        private static bool IsGarbageClassPtr(long cls)
+        {
+            if (cls == 0) return true;
+            if (cls >= 0x0000000100000000L && cls < 0x100000000L) return true; // low code/JIT range
+            IntPtr monoBase = DynDll.OpenLibrary("mono.dll");
+            if (monoBase != IntPtr.Zero &&
+                cls >= monoBase.ToInt64() && cls < monoBase.ToInt64() + (16L * 1024 * 1024)) return true; // &builtin_types[0]
+            return false;
+        }
+
+        // mono_class_get_image(MonoClass*) -> MonoImage*. cdecl, imported from mono.dll.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr d_MonoClassGetImage(IntPtr monoClass);
+
+        // Cached mono_class_get_image delegate (IAT slot 0x143D338B8).
+        private static d_MonoClassGetImage _monoClassGetImageCached;
+        private static IntPtr MonoClassGetImage(IntPtr monoClass)
+        {
+            if (_monoClassGetImageCached == null)
+            {
+                try { _monoClassGetImageCached = (d_MonoClassGetImage)Marshal.GetDelegateForFunctionPointer(
+                    Marshal.ReadIntPtr((IntPtr)0x143D338B8), typeof(d_MonoClassGetImage)); }
+                catch { _monoClassGetImageCached = null; }
+            }
+            if (_monoClassGetImageCached == null) return IntPtr.Zero;
+            return _monoClassGetImageCached(monoClass);
+        }
+
+        // Cached MonoManager* getter (RVA 0x14C2510). Resolved via Marshal directly because the guards
+        // fire DURING serialization, when Application APIs are not allowed.
+        private static d_GetMonoManagerPtr _getMonoManagerCached;
+        private static IntPtr GetMonoManagerSafe()
+        {
+            if (_getMonoManagerCached == null)
+            {
+                try
+                {
+                    IntPtr basePtr = DynDll.OpenLibrary("Unity.exe");
+                    if (basePtr != IntPtr.Zero)
+                        _getMonoManagerCached = (d_GetMonoManagerPtr)Marshal.GetDelegateForFunctionPointer(
+                            (IntPtr)(basePtr.ToInt64() + 0x14C2510), typeof(d_GetMonoManagerPtr));
+                }
+                catch { _getMonoManagerCached = null; }
+            }
+            if (_getMonoManagerCached == null) return IntPtr.Zero;
+            try { return _getMonoManagerCached(); } catch { return IntPtr.Zero; }
+        }
+
+        // Guard BuildSerializationCacheFor: return the NULL-class cache for stale/garbage classes
+        // so the serialization command queue is never built from freed class memory.
+        private static IntPtr OnBuildSerializationCacheFor(IntPtr classPtr, IntPtr createFlags)
+        {
+            // A garbage class would build a garbage command queue (SafeBinaryRead over-read -> reload
+            // crash). BuildSerializationCacheFor(NULL) is safe (base-fields-only cache), so use it.
+            long guardCls = 0;
+            try { guardCls = classPtr.ToInt64(); } catch { }
+            if (IsGarbageClassPtr(guardCls))
+                return _origBuildSerializationCacheFor(IntPtr.Zero, createFlags);
+            // A freed old-domain class passes the range check but its MonoImage is gone from MonoManager's
+            // image table; treat it as garbage too.
+            try
+            {
+                IntPtr img = MonoClassGetImage(classPtr);
+                if (img != IntPtr.Zero)
+                {
+                    IntPtr mgr = GetMonoManagerSafe();
+                    if (mgr != IntPtr.Zero)
+                    {
+                        IntPtr imgData = Marshal.ReadIntPtr(mgr, 0x208);
+                        IntPtr imgEnd = Marshal.ReadIntPtr(mgr, 0x210);
+                        long imgN = (imgEnd != IntPtr.Zero && imgData != IntPtr.Zero)
+                            ? (imgEnd.ToInt64() - imgData.ToInt64()) / 8 : 0;
+                        long imgVal = img.ToInt64();
+                        bool found = false;
+                        if (imgN > 0 && imgN < 10000)
+                        {
+                            for (long i = 0; i < imgN; i++)
+                            {
+                                if (Marshal.ReadInt64(imgData, (int)(i * 8)) == imgVal) { found = true; break; }
+                            }
+                        }
+                        if (!found) return _origBuildSerializationCacheFor(IntPtr.Zero, createFlags);
+                    }
+                }
+            }
+            catch { }
+            return _origBuildSerializationCacheFor(classPtr, createFlags);
+        }
+
+        // Return NULL (safe 'None') for stale field-value wrappers (NULL vtable or garbage klass) so
+        // the Inspector never type-checks a broken wrapper. Gated to Inspector time.
+        private static IntPtr OnObjectReferenceValue(IntPtr prop)
+        {
+            IntPtr wrapper = _origObjectReferenceValue(prop);
+            if (wrapper == IntPtr.Zero) return wrapper;
+            if (_insideReload || NativeHookManager.BuildInProgress || NativeHookManager.InsideBundleEATI) return wrapper;
+            try
+            {
+                IntPtr vtable = Marshal.ReadIntPtr(wrapper, 0);
+                if (vtable == IntPtr.Zero)
+                {
+                    // Stale wrapper: NULL vtable -> stelemref would NRE. Return null.
+                    return IntPtr.Zero;
+                }
+                IntPtr klass = Marshal.ReadIntPtr(vtable, 0);
+                long k = klass.ToInt64();
+                if (IsGarbageClassPtr(k))
+                {
+                    // Stale wrapper: garbage klass -> mono_class_init would AV. Return null.
+                    return IntPtr.Zero;
+                }
+                // A freed old-domain class's MonoImage is gone from MonoManager's image table -> stale.
+                try
+                {
+                    IntPtr image = MonoClassGetImage(klass);
+                    if (image == IntPtr.Zero) return IntPtr.Zero;
+                    IntPtr mgr = GetMonoManagerSafe();
+                    if (mgr != IntPtr.Zero)
+                    {
+                        IntPtr imgData = Marshal.ReadIntPtr(mgr, 0x208);
+                        IntPtr imgEnd = Marshal.ReadIntPtr(mgr, 0x210);
+                        long imgN = (imgEnd != IntPtr.Zero && imgData != IntPtr.Zero)
+                            ? (imgEnd.ToInt64() - imgData.ToInt64()) / 8 : 0;
+                        long img = image.ToInt64();
+                        bool found = false;
+                        if (imgN > 0 && imgN < 10000)
+                        {
+                            for (long i = 0; i < imgN; i++)
+                            {
+                                if (Marshal.ReadInt64(imgData, (int)(i * 8)) == img) { found = true; break; }
+                            }
+                        }
+                        if (!found) return IntPtr.Zero; // image not current -> stale class
+                    }
+                }
+                catch { }
+            }
+            catch { }
+            return wrapper;
+        }
+
+        private static IntPtr OnMonoBehaviourGetClass(IntPtr thisMB, IntPtr resultOut)
+        {
+            IntPtr ret = _origMonoBehaviourGetClass(thisMB, resultOut);
+            // Return 0 (safe 'missing script') when the class is garbage: null, in mono.dll's image
+            // (&builtin_types[0]), or in the low JIT/code region. Prevents the crash at reload step 7
+            // and Inspector time.
+            try
+            {
+                if (ret != IntPtr.Zero)
+                {
+                    long cls = ret.ToInt64();
+                    bool bad = false;
+                    IntPtr monoBase = DynDll.OpenLibrary("mono.dll");
+                    if (cls >= 0x0000000100000000L && cls < 0x100000000L) bad = true;          // low code/JIT range
+                    if (monoBase != IntPtr.Zero &&
+                        cls >= monoBase.ToInt64() && cls < monoBase.ToInt64() + (16L * 1024 * 1024)) bad = true; // &builtin_types[0]
+                    if (bad)
+                    {
+                        Marshal.WriteInt64(resultOut, 0);
+                        return resultOut;
+                    }
+                }
+            }
+            catch { }
+            return ret;
+        }
+
+        // Reload step-8 guard: skip the invoke when the MB's class (MB+160 -> cache+8) is garbage.
+        private static byte OnCallMethodInactive(IntPtr thisMB, IntPtr methodPtr)
+        {
+            try
+            {
+                if (thisMB != IntPtr.Zero)
+                {
+                    IntPtr cache = Marshal.ReadIntPtr(thisMB, 0xA0); // MB+160
+                    if (cache != IntPtr.Zero)
+                    {
+                        long cls = Marshal.ReadInt64((IntPtr)(cache.ToInt64() + 8)); // cache+8
+                        bool bad = (cls == 0);
+                        if (!bad)
+                        {
+                            IntPtr monoBase = DynDll.OpenLibrary("mono.dll");
+                            if (cls >= 0x0000000100000000L && cls < 0x100000000L) bad = true;
+                            if (monoBase != IntPtr.Zero &&
+                                cls >= monoBase.ToInt64() && cls < monoBase.ToInt64() + (16L * 1024 * 1024)) bad = true;
+                        }
+                        if (bad)
+                            return 1; // skip the invoke — reload must survive
+                    }
+                }
+            }
+            catch { }
+            return _origCallMethodInactive(thisMB, methodPtr);
+        }
+
+        private static IntPtr OnMonoScriptGetClass(IntPtr monoScript, IntPtr resultOut)
+        {
+            IntPtr ret = _origGetClass(monoScript, resultOut);
+            // Return 0 (safe 'missing script') when cache+8 is garbage (e.g. &mono!builtin_types[0]),
+            // which would otherwise crash the Inspector's mono_class_init write.
+            long guardCls = 0;
+            try { guardCls = Marshal.ReadInt64(resultOut); } catch { }
+            if (IsGarbageClassPtr(guardCls))
+            {
+                try { Marshal.WriteInt64(resultOut, 0); } catch { }
+            }
+            return ret;
+        }
+
+        // Repairs scene-referenced m_Script MonoScripts whose +216 cache+8 is ClassNotFound (they are
+        // not in FindObjectsOfType<MonoScript>, so the OnDomainLoad renewal never fixes them). Iterates
+        // live MonoBehaviours via FindInstanceIDsOfType<MonoBehaviour> (safe on corrupt MBs), dedups the
+        // referenced MonoScripts, and re-Renews any whose cache+8 is stale, using GetMonoClassWithAssemblyName
+        // as the authoritative class. Zeroes +216 first (avoid Renew's assert) and PropertiesHash (+200/+208).
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate long d_GetMonoClassWithAssemblyNameCdecl(IntPtr manager, IntPtr classNameStr, IntPtr namespaceStr, IntPtr asmNameStr);
+        // Object::FindInstanceIDsOfType — 0x14091E8D0. Fills an array with all live MonoBehaviour IDs.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate void d_FindInstanceIDsOfType(IntPtr rtti, IntPtr outArray, int sort);
+        // GetObjectFromInstanceId(int) -> Object* — 0x140AB9BB0.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr d_GetObjectFromInstanceId(int instanceId);
+
+        internal static void RepairSceneMonoScriptClasses()
+        {
+            try
+            {
+                var getMonoManager = (d_GetMonoManagerPtr)NativeHookManager.GetDelegateForFunctionPointer<d_GetMonoManagerPtr>(0x14C2510);
+                if (getMonoManager == null) return;
+                IntPtr mgr = getMonoManager();
+                if (mgr == IntPtr.Zero) return;
+
+                var gmcawn = (d_GetMonoClassWithAssemblyNameCdecl)NativeHookManager.GetDelegateForFunctionPointer<d_GetMonoClassWithAssemblyNameCdecl>(0x14C32E0);
+                var findMBs = (d_FindInstanceIDsOfType)NativeHookManager.GetDelegateForFunctionPointer<d_FindInstanceIDsOfType>(0x91E8D0);
+                var getObjById = (d_GetObjectFromInstanceId)NativeHookManager.GetDelegateForFunctionPointer<d_GetObjectFromInstanceId>(0xAB9BB0);
+                if (gmcawn == null || findMBs == null || getObjById == null) return;
+
+                // dynamic_array<int> header for FindInstanceIDsOfType output.
+                int maxMBs = 60000;
+                IntPtr mbDataBuf = Marshal.AllocHGlobal(maxMBs * 4);
+                IntPtr mbArrayHdr = Marshal.AllocHGlobal(64);
+                try
+                {
+                    for (int i = 0; i < 8; i++) Marshal.WriteInt64(mbArrayHdr, i * 8, 0);
+                    Marshal.WriteInt64(mbArrayHdr, 0, mbDataBuf.ToInt64());   // data
+                    Marshal.WriteInt64(mbArrayHdr, 24, 0);                    // size
+                    Marshal.WriteInt64(mbArrayHdr, 32, maxMBs);               // capacity
+
+                    // Object::FindInstanceIDsOfType(&TypeInfoContainer<MonoBehaviour>::rtti, &array, sort=false)
+                    findMBs(new IntPtr(0x143B3BC30), mbArrayHdr, 0);
+
+                    long mbCount = Marshal.ReadInt64(mbArrayHdr, 24);
+                    if (mbCount <= 0 || mbCount > maxMBs)
+                    {
+                        Debug.Log("[ManagedPluginDomainFix] RepairSceneMonoScriptClasses: bad MB count=" + mbCount);
+                        return;
+                    }
+
+                    var repairedMs = new HashSet<long>();
+                    int repaired = 0, checkedCount = 0, alreadyValid = 0, unresolved = 0, badCache = 0;
+                    for (long i = 0; i < mbCount; i++)
+                    {
+                        int mbId = Marshal.ReadInt32(mbDataBuf, (int)(i * 4));
+                        if (mbId == 0) continue;
+                        IntPtr mb = getObjById(mbId);
+                        if (mb == IntPtr.Zero) continue;
+
+                        // m_Script PPtr<MonoScript> at MB+0x68 (104): a 4-byte instance ID.
+                        int msId = Marshal.ReadInt32(mb, 0x68);
+                        if (msId == 0) continue;
+                        IntPtr ms = getObjById(msId);
+                        if (ms == IntPtr.Zero) continue;
+
+                        long msKey = ms.ToInt64();
+                        if (!repairedMs.Add(msKey)) continue;
+
+                        IntPtr cache = Marshal.ReadIntPtr(ms, MonoScriptCacheOffset); // +216
+                        long cls = 0;
+                        if (cache != IntPtr.Zero) cls = Marshal.ReadInt64((IntPtr)(cache.ToInt64() + CacheClassOffset)); // +8
+                        checkedCount++;
+                        bool garbage = IsGarbageClassPtr(cls);
+
+                        // A cache+8 class can pass the range check yet still be stale (old-domain image).
+                        // GetMonoClassWithAssemblyName is the authoritative class; renew if they differ.
+                        string className = UnityNativeHelper.ReadNativeString(ms, 0xE0);
+                        if (string.IsNullOrEmpty(className)) { unresolved++; continue; }
+
+                        long resolved = gmcawn(
+                            mgr,
+                            new IntPtr(msKey + 0xE0),    // className
+                            new IntPtr(msKey + 0x110),   // namespace
+                            new IntPtr(msKey + 0x140));  // assemblyName
+
+                        bool stale = false;
+                        if (resolved == 0)
+                        {
+                            // Assembly not resolvable in the current MonoManager image table. If the cache
+                            // class is already garbage, treat as broken; otherwise leave it (cannot verify).
+                            if (garbage) { badCache++; }
+                            else { alreadyValid++; }
+                            unresolved++;
+                            continue;
+                        }
+                        if (garbage) { stale = true; }
+                        else if (cls != resolved) { stale = true; }
+
+                        if (!stale)
+                        {
+                            alreadyValid++;
+                            continue;
+                        }
+                        badCache++;
+                        Marshal.WriteInt64(ms, MonoScriptCacheOffset, 0); // clear +216 (avoid Renew assert)
+                        Marshal.WriteInt64(ms, 200, 0);                    // zero PropertiesHash lo
+                        Marshal.WriteInt64(ms, 208, 0);                    // zero PropertiesHash hi
+                        _origMonoScriptRenew(msKey, resolved);
+                        repaired++;
+                    }
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(mbDataBuf);
+                    Marshal.FreeHGlobal(mbArrayHdr);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("[ManagedPluginDomainFix] RepairSceneMonoScriptClasses failed: " + ex.Message);
+            }
+        }
+
+        // MonoScript::Renew hook. Marks the reload window (EndReloadAssembly step 5). Previously returned
+        // early for H3VRCode (classPtr==0 before step 6 loads it), leaving +216 null and crashing step 8;
+        // now it passes classPtr==0 through so Renew creates a proper ClassNotFound cache, and
+        // RepairBrokenMonoScriptClasses fixes the real class at OnDomainLoad.
+        private static void OnMonoScriptRenew(long pMonoScript, long classPtr)
+        {
+            // Mark the reload window; the on-demand repair in OnMonoScriptGetClass only runs outside it.
+            _insideReload = true;
+            _origMonoScriptRenew(pMonoScript, classPtr);
+        }
+
+        // GetMonoClassWithAssemblyName hook: the original returns 0 for H3VRCode during reload step 5
+        // (H3VRCode not yet in MonoManager's image table). Re-resolve the class from the H3VRCode image so
+        // step 5's MonoScript_Renew produces a real cache. Runs inside the reload but does not re-enter it.
+        // Args: (MonoManager*, className*, namespace*, assemblyName*) as core::basic_string pointers.
+        private static long OnGetMonoClassWithAssemblyName(IntPtr monoManager, IntPtr classNameStr, IntPtr namespaceStr, IntPtr assemblyNameStr)
+        {
+            long ret = _origGetMonoClassWithAssemblyName(monoManager, classNameStr, namespaceStr, assemblyNameStr);
+            if (ret != 0) return ret;
+            try
+            {
+                // Fast path: only attempt the fallback for the H3VRCode assemblies.
+                string asmName = UnityNativeHelper.ReadNativeString(assemblyNameStr, 0);
+                if (string.IsNullOrEmpty(asmName)) return 0;
+                bool isH3VR = asmName.IndexOf("H3VRCode", StringComparison.OrdinalIgnoreCase) >= 0;
+                if (!isH3VR) return 0;
+
+                string className = UnityNativeHelper.ReadNativeString(classNameStr, 0);
+                string ns = UnityNativeHelper.ReadNativeString(namespaceStr, 0);
+                if (string.IsNullOrEmpty(className) || string.IsNullOrEmpty(ns)) return 0;
+
+                // Resolve the MonoClass* from the already-loaded H3VRCode assembly image.
+                long monoClass = ResolveH3VRCodeClass(asmName, ns, className);
+                if (monoClass != 0)
+                    return monoClass;
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("[ManagedPluginDomainFix] GetMonoClassWithAssemblyName fallback failed: " + ex.Message);
+                return 0;
+            }
+        }
+
+        // Resolves a MonoClass* via mono_assembly_loaded / get_image / class_from_name; 0 on failure.
+        // Import table: 0x143D33890 / 0x143D33668 / 0x143D33518.
+        private static long ResolveH3VRCodeClass(string assemblyName, string ns, string className)
+        {
+            try
+            {
+                var assemblyLoaded = (d_mono_assembly_loaded)NativeHookManager.GetDelegateForFunctionPointer<d_mono_assembly_loaded>(0x143D33890);
+                var assemblyGetImage = (d_mono_assembly_get_image)NativeHookManager.GetDelegateForFunctionPointer<d_mono_assembly_get_image>(0x143D33668);
+                var classFromName = (d_mono_class_from_name)NativeHookManager.GetDelegateForFunctionPointer<d_mono_class_from_name>(0x143D33518);
+                if (assemblyLoaded == null || assemblyGetImage == null || classFromName == null) return 0;
+
+                // Parse the name into a stack MonoAssemblyName, then load the assembly and image.
+                var assemblyNameParse = (d_mono_assembly_name_parse)NativeHookManager.GetDelegateForFunctionPointer<d_mono_assembly_name_parse>(0x143D33888);
+                if (assemblyNameParse == null) return 0;
+
+                IntPtr asmNameBuf = Marshal.AllocHGlobal(0x48);
+                IntPtr monoImage = IntPtr.Zero;
+                try
+                {
+                    for (int i = 0; i < 0x48; i += 8) Marshal.WriteInt64(asmNameBuf, i, 0);
+                    if (assemblyNameParse(assemblyName, asmNameBuf) == 0) return 0;
+                    IntPtr asm = assemblyLoaded(asmNameBuf);
+                    if (asm == IntPtr.Zero) return 0;
+                    monoImage = assemblyGetImage(asm);
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(asmNameBuf);
+                }
+                if (monoImage == IntPtr.Zero) return 0;
+
+                return classFromName(monoImage, ns, className);
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+
+        // mono.dll import shims. mono_assembly_name_parse(const char*, MonoAssemblyName*) — arg order
+        // verified from call site 0x1414C3525.
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate int d_mono_assembly_name_parse(string nameIn, IntPtr nameOut);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr d_mono_assembly_loaded(IntPtr aname);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate IntPtr d_mono_assembly_get_image(IntPtr assembly);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        private delegate long d_mono_class_from_name(IntPtr image, string ns, string name);
+
+        // OnDomainUnload handler REMOVED: MonoImporter.GetAllRuntimeMonoScripts() crashed there during
+        // AppDomain teardown ("MonoManager is NULL").
+
+        private static void OnDomainLoad()
+        {
+            // Repairs Assets/Managed MonoScripts whose caches are null/ClassNotFound post-reload, then
+            // retries once a few frames later (H3VRCode plugin loading can lag a tick).
+            try
+            {
+                RepairBrokenMonoScriptClasses();
+                BootCompleted = true;
+                EditorApplication.delayCall += delegate
+                {
+                    try { RepairBrokenMonoScriptClasses(); }
+                    catch (Exception ex2) { Debug.LogError("[ManagedPluginDomainFix] RepairBrokenMonoScriptClasses (retry) failed: " + ex2); }
+                };
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError("[ManagedPluginDomainFix] RepairBrokenMonoScriptClasses failed: " + ex);
+            }
+        }
 
         private static void SetMonoAssemblySearchPaths()
         {
@@ -393,310 +920,6 @@ namespace MeatKit
                    "  userData:\n  assetBundleName:\n  assetBundleVariant:";
         }
 
-        private static string FindFirstObjectAssetPath()
-        {
-            foreach (string p in AssetDatabase.GetAllAssetPaths())
-            {
-                if (p.EndsWith(".object.asset")) return p;
-            }
-            return null;
-        }
-
-        // Clears CachedSerializationData (MonoScriptCache+136) for all H3VR MonoScripts.
-        // The CSD can be lazily rebuilt with an incomplete class hierarchy after domain reload;
-        // clearing forces a fresh rebuild when the next SerializedObject is created.
-        private static void ClearH3VRSerializationCaches()
-        {
-            if (_cachedPtrField == null) return;
-            try
-            {
-                string h3vr = MeatKit.AssemblyRename + ".dll";
-                string h3vrFp = MeatKit.AssemblyFirstpassRename + ".dll";
-                int cleared = 0;
-                foreach (MonoScript ms in MonoImporter.GetAllRuntimeMonoScripts())
-                {
-                    if ((UnityEngine.Object)ms == null) continue;
-                    string ap = AssetDatabase.GetAssetPath(ms);
-                    if (string.IsNullOrEmpty(ap)) continue;
-                    string file = Path.GetFileName(ap);
-                    if (file != h3vr && file != h3vrFp) continue;
-
-                    IntPtr nMS = IntPtr.Zero;
-                    try { nMS = (IntPtr)_cachedPtrField.GetValue(ms); } catch (Exception) { }
-                    if (nMS == IntPtr.Zero) continue;
-
-                    IntPtr msCache = Marshal.ReadIntPtr(new IntPtr(nMS.ToInt64() + MonoScriptCacheOffset));
-                    if (msCache == IntPtr.Zero) continue;
-
-                    IntPtr csd = Marshal.ReadIntPtr(new IntPtr(msCache.ToInt64() + CacheSerDataOffset));
-                    if (csd != IntPtr.Zero)
-                    {
-                        Marshal.WriteIntPtr(new IntPtr(msCache.ToInt64() + CacheSerDataOffset), IntPtr.Zero);
-                        cleared++;
-                    }
-                }
-                if (cleared > 0)
-                    Log("ClearH3VRSerializationCaches: cleared CSD for " + cleared + " MonoScripts");
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning("[ManagedPluginDomainFix] ClearH3VRSerializationCaches: " + ex);
-            }
-        }
-
-        // Evicts and reimports stale .object.asset ScriptableObjects after a post-build domain reload.
-        // FVRObject SOs retain stale per-instance caches (SO+160) that ReleaseMonoScriptCaches skips
-        // (it only iterates MonoBehaviours). The stale cache omits AnvilAsset parent fields, causing
-        // FindProperty("m_anvilPrefab") to return null. UnloadAsset nulls SO+160, forcing
-        // SetupScriptingCache to rebuild from MonoScript+216. YAML is authoritative — no SaveAssets().
-        private static void RepairStaleObjectAssetCache()
-        {
-            try
-            {
-                string[] allPaths = AssetDatabase.GetAllAssetPaths();
-                var objectPaths = new List<string>();
-                foreach (string p in allPaths)
-                {
-                    if (p.EndsWith(".object.asset")) objectPaths.Add(p);
-                }
-                if (objectPaths.Count == 0) return;
-
-                // Quick check: if m_anvilPrefab.AssetName already has a value, skip.
-                string testPath = FindFirstObjectAssetPath();
-                if (testPath != null)
-                {
-                    UnityEngine.Object testObj = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(testPath);
-                    if (testObj != null)
-                    {
-                        SerializedObject testSo = new SerializedObject(testObj);
-                        SerializedProperty assetNameProp = testSo.FindProperty("m_anvilPrefab.AssetName");
-                        if (assetNameProp != null && !string.IsNullOrEmpty(assetNameProp.stringValue))
-                        {
-                            Log("Object asset cache OK — m_anvilPrefab present (" + objectPaths.Count + " assets)");
-                            return;
-                        }
-                        // Stale SO detected — unload it before proceeding.
-                        Resources.UnloadAsset(testObj);
-                    }
-                }
-
-                Log(string.Format("Stale Library cache detected — evicting {0} .object.asset SOs and reimporting", objectPaths.Count));
-
-                // Evict stale SOs — UnloadAsset nulls SO+160, letting SetupScriptingCache rebuild fresh.
-                int unloaded = 0;
-                foreach (string assetPath in objectPaths)
-                {
-                    try
-                    {
-                        UnityEngine.Object obj = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(assetPath);
-                        if (obj != null)
-                        {
-                            Resources.UnloadAsset(obj);
-                            unloaded++;
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.LogWarning("[ManagedPluginDomainFix] Error unloading " + assetPath + ": " + ex.Message);
-                    }
-                }
-                Log("Evicted " + unloaded + " stale ScriptableObjects");
-
-                // Reimport from disk — re-reads YAML with the now-correct TypeTree and updates Library cache.
-                AssetDatabase.StartAssetEditing();
-                try
-                {
-                    foreach (string assetPath in objectPaths)
-                    {
-                        AssetDatabase.ImportAsset(assetPath, ImportAssetOptions.ForceUpdate);
-                    }
-                }
-                finally
-                {
-                    AssetDatabase.StopAssetEditing();
-                }
-                Log(string.Format("Reimported {0} .object.asset files from YAML source", objectPaths.Count));
-
-                // Step 3: Verify fix.
-                if (testPath != null)
-                {
-                    UnityEngine.Object verifyObj = AssetDatabase.LoadAssetAtPath<UnityEngine.Object>(testPath);
-                    if (verifyObj != null)
-                    {
-                        SerializedObject verifySo = new SerializedObject(verifyObj);
-                        SerializedProperty verifyProp = verifySo.FindProperty("m_anvilPrefab.AssetName");
-                        if (verifyProp == null || string.IsNullOrEmpty(verifyProp.stringValue))
-                            Debug.LogWarning("[ManagedPluginDomainFix] Object asset cache repair FAILED — m_anvilPrefab still missing after evict+reimport");
-                        else
-                            Log("Object asset cache repair verified OK — m_anvilPrefab.AssetName=" + verifyProp.stringValue);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning("[ManagedPluginDomainFix] RepairStaleObjectAssetCache: " + ex);
-            }
-        }
-
-        private static bool _typeTreePrimed = false;
-        private static bool _forcedReimportScheduled = false;
-        private const string ReimportAttemptsPrefKey = "MPF_ReimportAttempts";
-        private const int    MaxReimportAttempts = 2;
-
-        // before BuildAssetBundles. No-op after first call per domain (_typeTreePrimed guard).
-        public static void PrimeTypeTreesForBuild()
-        {
-            if (_typeTreePrimed) return;
-            try
-            {
-                var initMethod = typeof(MonoScript).GetMethod("Init",
-                    BindingFlags.NonPublic | BindingFlags.Instance);
-                var getNsMethod = typeof(MonoScript).GetMethod("GetNamespace",
-                    BindingFlags.NonPublic | BindingFlags.Instance);
-                if (initMethod == null || getNsMethod == null) return;
-                string h3vr   = MeatKit.AssemblyRename + ".dll";
-                string h3vrFp = MeatKit.AssemblyFirstpassRename + ".dll";
-                int primed = 0;
-                // StartAssetEditing/StopAssetEditing + SaveAssets to persist and clear dirty flags.
-                AssetDatabase.StartAssetEditing();
-                try
-                {
-                    foreach (MonoScript script in MonoImporter.GetAllRuntimeMonoScripts())
-                    {
-                        if ((UnityEngine.Object)script == null) continue;
-                        string assetPath = AssetDatabase.GetAssetPath(script);
-                        if (string.IsNullOrEmpty(assetPath)) continue;
-                        string file = Path.GetFileName(assetPath);
-                        if (file != h3vr && file != h3vrFp) continue;
-                        string ns = (string)getNsMethod.Invoke(script, null);
-                        initMethod.Invoke(script, new object[] { "", script.name, ns, file, false });
-                        primed++;
-                    }
-                }
-                finally
-                {
-                    AssetDatabase.StopAssetEditing();
-                }
-                // Persist the primed TypeTree state and clear dirty flags before shutdown.
-                AssetDatabase.SaveAssets();
-                Log("PrimeTypeTreesForBuild: primed=" + primed);
-                _typeTreePrimed = true;
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning("[ManagedPluginDomainFix] PrimeTypeTreesForBuild failed: " + ex);
-            }
-        }
-
-        // Builds a HashSet of native MonoScript pointers for all Assets/Managed/ scripts.
-        private static HashSet<IntPtr> BuildManagedScriptNativePtrSet()
-        {
-            var set = new HashSet<IntPtr>();
-            if (_cachedPtrField == null) return set;
-            foreach (MonoScript ms in MonoImporter.GetAllRuntimeMonoScripts())
-            {
-                if ((UnityEngine.Object)ms == null) continue;
-                string ap = AssetDatabase.GetAssetPath(ms);
-                if (string.IsNullOrEmpty(ap) || !ap.StartsWith("Assets/Managed/", StringComparison.OrdinalIgnoreCase)) continue;
-                IntPtr nMS = IntPtr.Zero;
-                try { nMS = (IntPtr)_cachedPtrField.GetValue(ms); } catch (Exception) { }
-                if (nMS != IntPtr.Zero) set.Add(nMS);
-            }
-            return set;
-        }
-
-        // Native MonoScript/MonoScriptCache offsets (Unity 5.6.7f1 x64, verified by IDA).
-        private const int MonoScriptCacheOffset   = 216;  // MonoScript::m_ScriptCache
-        private const int CacheClassOffset        = 8;    // MonoScriptCache::m_pClass
-        private const int CacheSerDataOffset      = 136;  // MonoScriptCache::CachedSerializationData*
-
-        // MonoManager layout (Unity 5.6.7f1 x64, IDA-verified):
-        //   m_pScriptImages: +520 begin, +528 end | GetAssemblyIndexFromImage RVA: 0x14C25D0
-
-        // Patches the serialization gate (RVA 0xE3F670) that uses GetAssemblyIndexFromImage
-        // to check whether a MonoImage is in MonoManager::m_pScriptImages.
-        // H3VRCode isn't in the bitset at reload time (loaded later by PluginManager), so the
-        // gate returns false and drops struct fields like m_anvilPrefab from the TypeTree.
-        // Patch (RVA 0xE3F6D5): 83 F8 FF 0F 95 C0 → B0 01 90 90 90 90 (always return 1).
-        private const long RVA_GatePatchSite = 0xE3F6D5;
-        private static readonly byte[] GateOrigBytes = new byte[] { 0x83, 0xF8, 0xFF, 0x0F, 0x95, 0xC0 };
-        private static readonly byte[] GatePatchBytes = new byte[] { 0xB0, 0x01, 0x90, 0x90, 0x90, 0x90 };
-        private static bool _gatePatchApplied = false;
-
-        private static void PatchMonoManagerScriptImages()
-        {
-            if (_gatePatchApplied)
-            {
-                Log("PatchMonoManagerScriptImages: gate patch already applied");
-                return;
-            }
-            try
-            {
-                IntPtr unityMod = GetUnityModule();
-                if (unityMod == IntPtr.Zero)
-                {
-                    Log("PatchMonoManagerScriptImages: Unity module handle not available");
-                    return;
-                }
-
-                IntPtr patchAddr = new IntPtr(unityMod.ToInt64() + RVA_GatePatchSite);
-
-                // Verify the original bytes are what we expect
-                byte[] current = new byte[6];
-                Marshal.Copy(patchAddr, current, 0, 6);
-                bool bytesMatch = true;
-                for (int i = 0; i < 6; i++)
-                {
-                    if (current[i] != GateOrigBytes[i]) { bytesMatch = false; break; }
-                }
-
-                if (!bytesMatch)
-                {
-                    // Check if already patched
-                    bool alreadyPatched = true;
-                    for (int i = 0; i < 6; i++)
-                    {
-                        if (current[i] != GatePatchBytes[i]) { alreadyPatched = false; break; }
-                    }
-                    if (alreadyPatched)
-                    {
-                        _gatePatchApplied = true;
-                        Log("PatchMonoManagerScriptImages: gate already patched (from previous domain)");
-                        return;
-                    }
-                    var hexSb = new System.Text.StringBuilder();
-                    for (int i = 0; i < current.Length; i++) hexSb.AppendFormat("{0:X2} ", current[i]);
-                    Log("PatchMonoManagerScriptImages: unexpected bytes at gate patch site: " + hexSb);
-                    return;
-                }
-
-                // Make the page writable
-                uint oldProtect;
-                if (!VirtualProtect(patchAddr, (UIntPtr)6, 0x40 /* PAGE_EXECUTE_READWRITE */, out oldProtect))
-                {
-                    Log("PatchMonoManagerScriptImages: VirtualProtect failed");
-                    return;
-                }
-
-                // Apply the patch
-                Marshal.Copy(GatePatchBytes, 0, patchAddr, 6);
-
-                // Restore page protection
-                uint ignored;
-                VirtualProtect(patchAddr, (UIntPtr)6, oldProtect, out ignored);
-
-                // Flush instruction cache
-                FlushInstructionCache(GetCurrentProcess(), patchAddr, (UIntPtr)6);
-
-                _gatePatchApplied = true;
-                Log(string.Format("PatchMonoManagerScriptImages: gate function patched at 0x{0:X} (always return true for non-mscorlib serializable types)", patchAddr.ToInt64()));
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning("[ManagedPluginDomainFix] PatchMonoManagerScriptImages: " + ex);
-            }
-        }
-
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool VirtualProtect(IntPtr lpAddress, UIntPtr dwSize, uint flNewProtect, out uint lpflOldProtect);
 
@@ -706,366 +929,197 @@ namespace MeatKit
         [DllImport("kernel32.dll")]
         private static extern IntPtr GetCurrentProcess();
 
-        // Clears CachedSerializationData for all MBs/MonoScripts before EATI, forcing
-        // TypeTree rebuild from live pClass (fixes Build 2 stale-metadata regression).
-        internal static void ReprimeMBCachesBeforeEATI()
+        private static void ApplyCheckTypeSerializablePatch()
         {
+            if (_gatePatchApplied) return;
             try
             {
-                if (_cachedPtrField == null) return;
-                FieldInfo cachedPtrField = _cachedPtrField;
-                // Step 1: Build lookup of H3VRCode MonoScript native pointers for MB+160 patching.
-                var msLookup = BuildManagedScriptNativePtrSet();
+                IntPtr unityBase = DynDll.OpenLibrary("Unity.exe");
+                IntPtr patchAddr = (IntPtr)(unityBase.ToInt64() + RVA_GatePatchSite);
 
-                // Step 2: Clear cache+136 for ALL MBs (forces rebuild from live pClass).
-                int fixed0 = 0, cleared = 0, alreadyOk = 0;
-
-                UnityEngine.Object[] allMBs = null;
-                try { allMBs = Resources.FindObjectsOfTypeAll(typeof(MonoBehaviour)); }
-                catch (Exception ex) { BuildLog.WriteLine("ReprimeMBCachesBeforeEATI: FindObjectsOfTypeAll failed: " + ex.Message); return; }
-
-                foreach (UnityEngine.Object obj in allMBs)
+                byte[] current = new byte[6];
+                Marshal.Copy(patchAddr, current, 0, 6);
+                bool match = true;
+                for (int i = 0; i < 6; i++)
                 {
-                    MonoBehaviour mb = obj as MonoBehaviour;
-                    if (mb == null) continue;
-
-                    IntPtr nMB = IntPtr.Zero;
-                    try { nMB = (IntPtr)cachedPtrField.GetValue(obj); } catch (Exception) { }
-                    if (nMB == IntPtr.Zero) continue;
-
-                    try
-                    {
-                        // (a) For H3VRCode MBs: also patch MB+160 to match MonoScript+216
-                        MonoScript ms2 = MonoScript.FromMonoBehaviour(mb);
-                        if ((UnityEngine.Object)ms2 != null)
-                        {
-                            IntPtr nMS2 = IntPtr.Zero;
-                            try { nMS2 = (IntPtr)cachedPtrField.GetValue(ms2); } catch (Exception) { }
-                            if (nMS2 != IntPtr.Zero && msLookup.Contains(nMS2))
-                            {
-                                IntPtr correctCache = Marshal.ReadIntPtr(new IntPtr(nMS2.ToInt64() + MonoScriptCacheOffset));
-                                if (correctCache != IntPtr.Zero)
-                                {
-                                    IntPtr pClass = Marshal.ReadIntPtr(new IntPtr(correctCache.ToInt64() + CacheClassOffset));
-                                    if (pClass != IntPtr.Zero)
-                                    {
-                                        IntPtr mbCache = Marshal.ReadIntPtr(new IntPtr(nMB.ToInt64() + 160));
-                                        if (mbCache != correctCache)
-                                        {
-                                            Marshal.WriteIntPtr(new IntPtr(nMB.ToInt64() + 160), correctCache);
-                                            fixed0++;
-                                        }
-                                        else { alreadyOk++; }
-                                    }
-                                }
-                            }
-                        }
-
-                        // (b) Clear cache+136 for ALL MBs (forces rebuild from correct pClass).
-                        IntPtr mbCacheToCheck = Marshal.ReadIntPtr(new IntPtr(nMB.ToInt64() + 160));
-                        if (mbCacheToCheck != IntPtr.Zero)
-                        {
-                            IntPtr serData = Marshal.ReadIntPtr(new IntPtr(mbCacheToCheck.ToInt64() + CacheSerDataOffset));
-                            if (serData != IntPtr.Zero)
-                            {
-                                Marshal.WriteIntPtr(new IntPtr(mbCacheToCheck.ToInt64() + CacheSerDataOffset), IntPtr.Zero);
-                                cleared++;
-                            }
-                        }
-                    }
-                    catch (Exception) { }
-                }
-                BuildLog.WriteLine(string.Format(
-                    "ReprimeMBCachesBeforeEATI: scanned {0} MBs, patched MB+160={1}, alreadyOk={2}, clearedSerData(MB)={3}",
-                    allMBs.Length, fixed0, alreadyOk, cleared));
-
-                // Step 3: Clear MonoScript+216+136 directly (may differ from MB+160 cache).
-                int msCleared = 0;
-                foreach (MonoScript ms3 in MonoImporter.GetAllRuntimeMonoScripts())
-                {
-                    if ((UnityEngine.Object)ms3 == null) continue;
-                    IntPtr nMS3 = IntPtr.Zero;
-                    try { nMS3 = (IntPtr)cachedPtrField.GetValue(ms3); } catch (Exception) { }
-                    if (nMS3 == IntPtr.Zero) continue;
-                    try
-                    {
-                        IntPtr msCache = Marshal.ReadIntPtr(new IntPtr(nMS3.ToInt64() + MonoScriptCacheOffset));
-                        if (msCache != IntPtr.Zero)
-                        {
-                            IntPtr serData = Marshal.ReadIntPtr(new IntPtr(msCache.ToInt64() + CacheSerDataOffset));
-                            if (serData != IntPtr.Zero)
-                            {
-                                Marshal.WriteIntPtr(new IntPtr(msCache.ToInt64() + CacheSerDataOffset), IntPtr.Zero);
-                                msCleared++;
-                            }
-                        }
-                    }
-                    catch (Exception) { }
-                }
-                BuildLog.WriteLine("ReprimeMBCachesBeforeEATI: cleared MonoScript+216+136 for " + msCleared + " scripts");
-            }
-            catch (Exception ex)
-            {
-                BuildLog.WriteLine("ReprimeMBCachesBeforeEATI failed: " + ex.Message);
-            }
-        }
-
-        // Re-primes MonoScript caches after EATI by calling Init() for all Assets/Managed/ scripts.
-        // Skips StartAssetEditing/SaveAssets to avoid import cycles mid-build.
-        internal static void ReprimeSilentAfterEATI()
-        {
-            try
-            {
-                var initMethod = typeof(MonoScript).GetMethod("Init",
-                    BindingFlags.NonPublic | BindingFlags.Instance);
-                var getNsMethod = typeof(MonoScript).GetMethod("GetNamespace",
-                    BindingFlags.NonPublic | BindingFlags.Instance);
-                if (initMethod == null || getNsMethod == null) return;
-
-                // Used to read native MonoScript pointer for cache-patching.
-                FieldInfo cachedPtrField = _cachedPtrField;
-                // Ensure correct H3VRCode DLLs in ScriptAssemblies/ before Init() (standalone
-                // compile may have replaced them with stubs lacking Anvil namespace).
-                EnsureH3VRCodeInScriptAssemblies();
-                int primed = 0;
-                foreach (MonoScript script in MonoImporter.GetAllRuntimeMonoScripts())
-                {
-                    if ((UnityEngine.Object)script == null) continue;
-                    string assetPath = AssetDatabase.GetAssetPath(script);
-                    if (string.IsNullOrEmpty(assetPath)) continue;
-                    if (!assetPath.StartsWith("Assets/Managed/", StringComparison.OrdinalIgnoreCase)) continue;
-                    string file = Path.GetFileName(assetPath);
-                    string ns   = (string)getNsMethod.Invoke(script, null);
-
-                    initMethod.Invoke(script, new object[] { "", script.name, ns, file, false });
-                    // Clear CachedSerializationData after Init() to discard stub TypeTree.
-                    if (cachedPtrField != null)
-                    {
-                        IntPtr nMS = IntPtr.Zero;
-                        try { nMS = (IntPtr)cachedPtrField.GetValue(script); } catch (Exception) { }
-                        if (nMS != IntPtr.Zero)
-                        {
-                            try
-                            {
-                                IntPtr cache = Marshal.ReadIntPtr(new IntPtr(nMS.ToInt64() + MonoScriptCacheOffset));
-                                if (cache != IntPtr.Zero)
-                                {
-                                    IntPtr oldSerData = Marshal.ReadIntPtr(new IntPtr(cache.ToInt64() + CacheSerDataOffset));
-                                    if (oldSerData != IntPtr.Zero)
-                                    {
-                                        Marshal.WriteIntPtr(new IntPtr(cache.ToInt64() + CacheSerDataOffset), IntPtr.Zero);
-                                    }
-                                }
-                            }
-                            catch (Exception) { }
-                        }
-                    }
-                    primed++;
-                }
-                BuildLog.WriteLine("ReprimeSilentAfterEATI: primed " + primed + " plugin-DLL scripts");
-
-                // Part 2: patch MB+160 for managed-script MBs (safe: MonoBehaviour has no Anvil fields).
-                if (cachedPtrField != null)
-                {
-                    var msLookup = BuildManagedScriptNativePtrSet();
-
-                    int mbPart2Fixed = 0;
-                    UnityEngine.Object[] allMBs = null;
-                    try { allMBs = Resources.FindObjectsOfTypeAll(typeof(MonoBehaviour)); }
-                    catch (Exception ex2) { BuildLog.WriteLine("ReprimeSilentAfterEATI Part2: FindObjectsOfTypeAll(MB) failed: " + ex2.Message); }
-
-                    if (allMBs != null)
-                    {
-                        foreach (UnityEngine.Object obj2 in allMBs)
-                        {
-                            MonoBehaviour mb2 = obj2 as MonoBehaviour;
-                            if (mb2 == null) continue;
-                            MonoScript ms3 = MonoScript.FromMonoBehaviour(mb2);
-                            if ((UnityEngine.Object)ms3 == null) continue;
-                            IntPtr nMS3 = IntPtr.Zero;
-                            try { nMS3 = (IntPtr)cachedPtrField.GetValue(ms3); } catch (Exception) { }
-                            if (nMS3 == IntPtr.Zero || !msLookup.Contains(nMS3)) continue;
-                            IntPtr nMB2 = IntPtr.Zero;
-                            try { nMB2 = (IntPtr)cachedPtrField.GetValue(obj2); } catch (Exception) { }
-                            if (nMB2 == IntPtr.Zero) continue;
-                            try
-                            {
-                                IntPtr correctCache2 = Marshal.ReadIntPtr(new IntPtr(nMS3.ToInt64() + MonoScriptCacheOffset));
-                                if (correctCache2 == IntPtr.Zero) continue;
-                                IntPtr correctClass2 = Marshal.ReadIntPtr(new IntPtr(correctCache2.ToInt64() + CacheClassOffset));
-                                if (correctClass2 == IntPtr.Zero) continue;
-                                IntPtr mbCachePtr = Marshal.ReadIntPtr(new IntPtr(nMB2.ToInt64() + 160));
-                                if (mbCachePtr == correctCache2) continue;
-                                Marshal.WriteIntPtr(new IntPtr(nMB2.ToInt64() + 160), correctCache2);
-                                mbPart2Fixed++;
-                            }
-                            catch (Exception) { }
-                        }
-                        BuildLog.WriteLine("ReprimeSilentAfterEATI Part2: scanned " + allMBs.Length + " MBs, fixed=" + mbPart2Fixed);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning("[ManagedPluginDomainFix] ReprimeSilentAfterEATI failed: " + ex);
-            }
-        }
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        private delegate void d_MonoScriptRebuildFromAwake(IntPtr thisPtr);
-        // RVA of MonoScript::RebuildFromAwake in Unity.exe 5.6.7f1 x64.
-        private const long RebuildFromAwakeRva = 0xe369d0L;
-        // caller: "ctor" (direct ctor call) or "delayCall" (backup, fires after PIOLA).
-        private static void RepairH3VRCodeMonoScripts(string caller)
-        {
-            try
-            {
-                if (!EditorVersion.IsSupportedVersion) return;
-                string h3vr   = MeatKit.AssemblyRename + ".dll";
-                string h3vrFp = MeatKit.AssemblyFirstpassRename + ".dll";
-                // First pass: count nulls.
-                int total = 0, broken = 0;
-                foreach (MonoScript s in MonoImporter.GetAllRuntimeMonoScripts())
-                {
-                    if ((UnityEngine.Object)s == null) continue;
-                    string f = Path.GetFileName(AssetDatabase.GetAssetPath(s));
-                    if (f != h3vr && f != h3vrFp) continue;
-                    total++;
-                    if (s.GetClass() == null) broken++;
+                    if (current[i] != GateOrigBytes[i]) { match = false; break; }
                 }
 
-                if (broken == 0)
+                if (!match)
                 {
-                    EditorPrefs.DeleteKey(ReimportAttemptsPrefKey);  // reset for future fresh runs
-                    Log("RepairH3VRCodeMonoScripts(" + caller + "): all " + total + " scripts healthy");
+                    bool already = true;
+                    for (int i = 0; i < 6; i++)
+                        if (current[i] != GatePatchBytes[i]) { already = false; break; }
+                    if (already) { _gatePatchApplied = true; return; }
+                    Debug.LogWarning("[ManagedPluginDomainFix] CheckTypeSerializable: unexpected bytes at patch site — skipping");
                     return;
                 }
 
-                Debug.LogWarning(string.Format(
-                    "[ManagedPluginDomainFix] RepairH3VRCodeMonoScripts({2}): {0}/{1} H3VRCode scripts null — rebuilding ALL {1} scripts (stale m_pClass fix)",
-                    broken, total, caller));
-
-                IntPtr unityBase = GetModuleHandle("Unity.exe");
-                if (unityBase == IntPtr.Zero) unityBase = GetUnityModule();
-                if (unityBase == IntPtr.Zero)
-                {
-                    Debug.LogWarning("[ManagedPluginDomainFix] RepairH3VRCodeMonoScripts: Unity.exe module not found");
-                    return;
-                }
-
-                IntPtr fnPtr = new IntPtr(unityBase.ToInt64() + RebuildFromAwakeRva);
-                var rebuildFromAwake = (d_MonoScriptRebuildFromAwake)Marshal.GetDelegateForFunctionPointer(
-                    fnPtr, typeof(d_MonoScriptRebuildFromAwake));
-
-                if (_cachedPtrField == null) return;
-                FieldInfo cachedPtrField = _cachedPtrField;
-                // Rebuild ALL scripts (not just null). After domain reload, prior m_pClass ptrs
-                // become dangling — RebuildFromAwake updates to current domain's MonoClass.
-                int repaired = 0, skipped = 0;
-                foreach (MonoScript s in MonoImporter.GetAllRuntimeMonoScripts())
-                {
-                    if ((UnityEngine.Object)s == null) continue;
-                    string f = Path.GetFileName(AssetDatabase.GetAssetPath(s));
-                    if (f != h3vr && f != h3vrFp) continue;
-
-                    IntPtr nativePtr = (IntPtr)cachedPtrField.GetValue(s);
-                    if (nativePtr == IntPtr.Zero) { skipped++; continue; }
-                    rebuildFromAwake(nativePtr);
-                    repaired++;
-                }
-                // Verification pass.
-                int stillBroken = 0;
-                foreach (MonoScript s in MonoImporter.GetAllRuntimeMonoScripts())
-                {
-                    if ((UnityEngine.Object)s == null) continue;
-                    string f = Path.GetFileName(AssetDatabase.GetAssetPath(s));
-                    if (f != h3vr && f != h3vrFp) continue;
-                    if (s.GetClass() == null) stillBroken++;
-                }
-
-                Log(string.Format(
-                    "RepairH3VRCodeMonoScripts({3}): repaired={0} skipped={1} stillBroken={2}",
-                    repaired, skipped, stillBroken, caller));
-
-                // Discard repair-triggered RequestScriptReload.
-                if (stillBroken == 0)
-                {
-                    NativeHookManager.DiscardPendingScriptReload();
-                    return;
-                }
-
-                // Schedule force-reimport if still broken (max once per domain).
-                // Discard repair-triggered RequestScriptReload.
-                NativeHookManager.DiscardPendingScriptReload();
-                int _reimportAttempts = EditorPrefs.GetInt(ReimportAttemptsPrefKey, 0);
-                if (stillBroken > 0 && !_forcedReimportScheduled && _reimportAttempts < MaxReimportAttempts)
-                {
-                    EditorPrefs.SetInt(ReimportAttemptsPrefKey, _reimportAttempts + 1);
-                    _forcedReimportScheduled = true;
-                    string mainPath = "Assets/Managed/" + h3vr;
-                    string fpPath   = "Assets/Managed/" + h3vrFp;
-                    Debug.LogWarning(string.Format(
-                        "[ManagedPluginDomainFix] RepairH3VRCodeMonoScripts({0}): {1} scripts still null — scheduling force reimport to restore inspector",
-                        caller, stillBroken));
-                    EditorApplication.delayCall += delegate
-                    {
-                        try
-                        {
-                            AssetDatabase.ImportAsset(mainPath, ImportAssetOptions.ForceUpdate);
-                            AssetDatabase.ImportAsset(fpPath,   ImportAssetOptions.ForceUpdate);
-                        }
-                        catch (Exception reimportEx)
-                        {
-                            Debug.LogWarning("[ManagedPluginDomainFix] Force reimport failed: " + reimportEx.Message);
-                        }
-                    };
-                }
+                uint oldProtect;
+                if (!VirtualProtect(patchAddr, (UIntPtr)6, 0x40, out oldProtect)) return;
+                Marshal.Copy(GatePatchBytes, 0, patchAddr, 6);
+                uint ignored;
+                VirtualProtect(patchAddr, (UIntPtr)6, oldProtect, out ignored);
+                FlushInstructionCache(GetCurrentProcess(), patchAddr, (UIntPtr)6);
+                _gatePatchApplied = true;
             }
             catch (Exception ex)
             {
-                Debug.LogWarning("[ManagedPluginDomainFix] RepairH3VRCodeMonoScripts(" + caller + "): " + ex);
+                Debug.LogWarning("[ManagedPluginDomainFix] ApplyCheckTypeSerializablePatch: " + ex.Message);
             }
         }
 
-        // Cached delegate for hot-path calls from OnMonoScriptTransferWrite.
-        private static d_MonoScriptRebuildFromAwake _rebuildFromAwakeDelegate;
-
-        // Calls RebuildFromAwake + clears CachedSerializationData on a native MonoScript pointer
-        // immediately before bundle serialization to ensure the TypeTree uses the live H3VRCode pClass.
-        internal static void ReprimeSingleNativeScript(IntPtr nativePtr)
+        // Applies the SetupScriptingCache early-exit NOP patch (see constants above). Refuses to
+        // patch if the current bytes don't match the expected originals (wrong binary/version).
+        private static void ApplySetupScriptingCachePatch()
         {
-            if (nativePtr == IntPtr.Zero) return;
+            if (_ssCachePatchApplied) return;
             try
             {
-                if (_rebuildFromAwakeDelegate == null)
+                IntPtr unityBase = DynDll.OpenLibrary("Unity.exe");
+                IntPtr patchAddr = (IntPtr)(unityBase.ToInt64() + RVA_SetupScriptingCacheEarlyExit);
+
+                byte[] current = new byte[6];
+                Marshal.Copy(patchAddr, current, 0, 6);
+                bool match = true;
+                for (int i = 0; i < 6; i++)
+                    if (current[i] != SSCacheOrigBytes[i]) { match = false; break; }
+
+                if (!match)
                 {
-                    IntPtr unityBase = GetModuleHandle("Unity.exe");
-                    if (unityBase == IntPtr.Zero) unityBase = GetUnityModule();
-                    if (unityBase == IntPtr.Zero) return;
-                    IntPtr fnPtr = new IntPtr(unityBase.ToInt64() + RebuildFromAwakeRva);
-                    _rebuildFromAwakeDelegate = (d_MonoScriptRebuildFromAwake)
-                        Marshal.GetDelegateForFunctionPointer(fnPtr, typeof(d_MonoScriptRebuildFromAwake));
+                    bool already = true;
+                    for (int i = 0; i < 6; i++)
+                        if (current[i] != SSCachePatchBytes[i]) { already = false; break; }
+                    if (already) { _ssCachePatchApplied = true; return; }
+                    Debug.LogWarning("[ManagedPluginDomainFix] SetupScriptingCache: unexpected bytes at patch site - skipping");
+                    return;
                 }
-                _rebuildFromAwakeDelegate(nativePtr);
-                // RebuildFromAwake queues a RequestScriptReload as a side effect; discard it to
-                // prevent accumulating pending reloads that would fire after BuildAssetBundles.
-                NativeHookManager.DiscardPendingScriptReload();
-                IntPtr freshCache = Marshal.ReadIntPtr(new IntPtr(nativePtr.ToInt64() + MonoScriptCacheOffset));
-                if (freshCache != IntPtr.Zero)
-                {
-                    Marshal.WriteIntPtr(new IntPtr(freshCache.ToInt64() + CacheSerDataOffset), IntPtr.Zero);
-                }
+
+                uint oldProtect;
+                if (!VirtualProtect(patchAddr, (UIntPtr)6, 0x40, out oldProtect)) return;
+                Marshal.Copy(SSCachePatchBytes, 0, patchAddr, 6);
+                uint ignored;
+                VirtualProtect(patchAddr, (UIntPtr)6, oldProtect, out ignored);
+                FlushInstructionCache(GetCurrentProcess(), patchAddr, (UIntPtr)6);
+                _ssCachePatchApplied = true;
             }
             catch (Exception ex)
             {
-                BuildLog.WriteLine("ReprimeSingleNativeScript: " + ex.Message);
+                Debug.LogWarning("[ManagedPluginDomainFix] ApplySetupScriptingCachePatch: " + ex.Message);
             }
         }
 
-        private static void Log(string msg)
+        // Installs the domain-fix detours and byte patches. Runs from the static ctor.
+        private static void InstallDomainFixHooks()
         {
-#pragma warning disable 0162
-            if (DebugLogging) Debug.Log("[ManagedPluginDomainFix] " + msg);
-#pragma warning restore 0162
+            if (!EditorVersion.IsSupportedVersion) return;
+
+            NativeHookFunctionOffsets offsets = EditorVersion.Current.FunctionOffsets;
+
+            // Install MonoScript::GetClass hook (guarded by OnMonoScriptGetClass).
+            long getClassOffset = offsets.GetClass;
+            if (getClassOffset != 0)
+            {
+                try
+                {
+                    _origGetClass = NativeHookManager.ApplyEditorDetour<d_GetClass>(
+                        getClassOffset,
+                        new d_GetClass(OnMonoScriptGetClass));
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("[ManagedPluginDomainFix] Failed to install GetClass detour: " + ex.Message);
+                }
+
+                // Guard MonoBehaviour::GetClass: return 0 for garbage per-instance classes to prevent
+                // the reload step-7 and Inspector crashes.
+                try
+                {
+                    _origMonoBehaviourGetClass = NativeHookManager.ApplyEditorDetour<d_MonoBehaviourGetClass>(
+                        0x14BC7B0,
+                        new d_MonoBehaviourGetClass(OnMonoBehaviourGetClass));
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("[ManagedPluginDomainFix] Failed to install MonoBehaviour::GetClass detour: " + ex.Message);
+                }
+
+                // Guard CallMethodInactive (reload step 8): skip invokes on MBs whose class is garbage.
+                try
+                {
+                    _origCallMethodInactive = NativeHookManager.ApplyEditorDetour<d_CallMethodInactive>(
+                        0x14BC9E0,
+                        new d_CallMethodInactive(OnCallMethodInactive));
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("[ManagedPluginDomainFix] Failed to install CallMethodInactive detour: " + ex.Message);
+                }
+            }
+
+            // Install MonoScript_Renew hook. Marks the reload window (see OnMonoScriptRenew).
+            long msrOffset = offsets.MonoScriptRenew;
+            if (msrOffset != 0)
+            {
+                try
+                {
+                    _origMonoScriptRenew = NativeHookManager.ApplyEditorDetour<MonoScriptRenewDelegate>(
+                        msrOffset,
+                        new MonoScriptRenewDelegate(OnMonoScriptRenew));
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("[ManagedPluginDomainFix] Failed to install MonoScript_Renew detour: " + ex.Message);
+                }
+            }
+
+            // Detour MonoManager::GetMonoClassWithAssemblyName so reload step 5 resolves H3VRCode
+            // classes instead of returning 0 (see OnGetMonoClassWithAssemblyName).
+            try
+            {
+                _origGetMonoClassWithAssemblyName = NativeHookManager.ApplyEditorDetour<d_GetMonoClassWithAssemblyName>(
+                    0x14C32E0,
+                    new d_GetMonoClassWithAssemblyName(OnGetMonoClassWithAssemblyName));
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("[ManagedPluginDomainFix] Failed to install GetMonoClassWithAssemblyName detour: " + ex.Message);
+            }
+
+            // Guard BuildSerializationCacheFor against stale/garbage classes during step-7 restore.
+            try
+            {
+                _origBuildSerializationCacheFor = NativeHookManager.ApplyEditorDetour<d_BuildSerializationCacheFor>(
+                    0xE4BD30,
+                    new d_BuildSerializationCacheFor(OnBuildSerializationCacheFor));
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("[ManagedPluginDomainFix] Failed to install BuildSerializationCacheFor detour: " + ex.Message);
+            }
+
+            // Guard SerializedProperty.objectReferenceValue: return NULL for stale wrappers whose
+            // vtable/klass is garbage, so the Inspector never type-checks a broken wrapper.
+            try
+            {
+                _origObjectReferenceValue = NativeHookManager.ApplyEditorDetour<d_ObjectReferenceValue>(
+                    0x1386D30,
+                    new d_ObjectReferenceValue(OnObjectReferenceValue));
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("[ManagedPluginDomainFix] Failed to install objectReferenceValue guard detour: " + ex.Message);
+            }
+
+            // Apply the CheckTypeSerializable gate patch immediately (process-lifetime code section
+            // patch, no domain dependencies). Wrapped in try/catch so failures don't break the ctor.
+            try { ApplyCheckTypeSerializablePatch(); }
+            catch (Exception ex) { Debug.LogWarning("[ManagedPluginDomainFix] Gate patch failed: " + ex.Message); }
+
+            // NOP the SetupScriptingCache early-exit so MB+160 always rebuilds from the current
+            // MonoScript cache (prevents the stale-domain MB+160 crash during the post-build reload).
+            try { ApplySetupScriptingCachePatch(); }
+            catch (Exception ex) { Debug.LogWarning("[ManagedPluginDomainFix] SetupScriptingCache patch failed: " + ex.Message); }
         }
 
     }

@@ -106,7 +106,9 @@ namespace MeatKit
         // BuildAssetBundles). When set, AHVTI blocks ALL Assets/Managed/ DLLs; otherwise (standalone/
         // startup EATI) only H3VRCode is blocked so other plugin DLLs remain available to the compiler.
         internal static volatile bool InsideBundleEATI = false;
-
+        // True from just before MeatKit.DoBuild() until the build completes. Gates guards that must
+        // not alter results during the build's own serialization.
+        internal static volatile bool BuildInProgress = false;
         // When true, the AHVTI hook allows ALL assemblies through (no blocking).
         // Set by ManagedPluginDomainFix during a targeted DLL reimport to let EATI
         // regenerate the correct TypeTree for H3VRCode without a domain reload.
@@ -288,7 +290,7 @@ namespace MeatKit
                 catch (Exception ex)
                 {
                     Debug.LogWarning("[NativeHookManager] Failed to install RequestScriptReload hook. " +
-                                     "H3VRCode ctor repair will fall back to delayCall (broken inspector). Exception: " + ex.Message);
+                                     "H3VRCode ctor repair may cause domain reload loop. Exception: " + ex.Message);
                 }
             }
 
@@ -333,93 +335,33 @@ namespace MeatKit
                 }
             }
 
+
             // STOA hook REMOVED — permanently no-op'ing STOA hung Unity on WM_CLOSE (Mono needs it
             // for teardown). IO-worker deadlock is fixed instead by TerminateMonoIOWorkers() below.
 
             // NOTE: PIOLA and ReloadAllUsedAssemblies hooks are not installed — both are
             // re-entrant from an [InitializeOnLoad] context and cause crashes in mono.dll.
 
+
+
             // NativeDetour objects cause Mono's CRT atexit to deadlock on exit().
-            // Hook editorApplicationQuit (fires before exit()) so we have a fallback if that happens.
+            // Hook editorApplicationQuit (fires before exit()) so we have a fallback
+            // (5s watchdog -> ExitProcess) if native shutdown hangs on close.
             RegisterQuitCallback();
-        }
 
-        private static void RegisterQuitCallback()
-        {
-            try
+
+            // Suppress any RequestScriptReload that fires during the first update cycle
+            // (from native checks after domain init).  The delayCall clears suppression
+            // and replays only one final reload if one was suppressed.
+            SuppressRequestScriptReload = true;
+            EditorApplication.delayCall += delegate
             {
-                var field = typeof(EditorApplication).GetField(
-                    "editorApplicationQuit",
-                    System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
-                if (field != null)
-                {
-                    var existing = (UnityEngine.Events.UnityAction)field.GetValue(null);
-                    field.SetValue(null, (UnityEngine.Events.UnityAction)delegate
-                    {
-                        // Run any previously-registered quit callbacks first
-                        if (existing != null)
-                        {
-                            try { existing(); }
-                            catch { }
-                        }
+                SuppressRequestScriptReload = false;
+                // RepairPluginMonoScripts() DISABLED: its reflection on MonoScript m_CachedPtr
+                // hard-faults the Editor; the Remapper-based fix handles it instead.
+                ReplayPendingScriptReloadIfNeeded();
+            };
 
-                        // Let native shutdown persist scene/layout state instead of killing
-                        // immediately; kill once both files are written, or after 15s as a
-                        // fallback.
-                        string libraryDir = System.IO.Path.GetFullPath(
-                            System.IO.Path.Combine(UnityEngine.Application.dataPath, "../Library"));
-                        string[] stateFiles =
-                        {
-                            System.IO.Path.Combine(libraryDir, "LastSceneManagerSetup.txt"),
-                            System.IO.Path.Combine(libraryDir, "CurrentLayout.dwlt")
-                        };
-                        var baselines = new DateTime[stateFiles.Length];
-                        for (int i = 0; i < stateFiles.Length; i++)
-                            baselines[i] = System.IO.File.Exists(stateFiles[i])
-                                ? System.IO.File.GetLastWriteTimeUtc(stateFiles[i])
-                                : DateTime.MinValue;
-
-                        var watchdog = new System.Threading.Thread(() =>
-                        {
-                            var deadline = DateTime.UtcNow.AddSeconds(15);
-                            bool allWritten = false;
-                            while (DateTime.UtcNow < deadline)
-                            {
-                                allWritten = true;
-                                for (int i = 0; i < stateFiles.Length; i++)
-                                {
-                                    try
-                                    {
-                                        if (!System.IO.File.Exists(stateFiles[i]) ||
-                                            System.IO.File.GetLastWriteTimeUtc(stateFiles[i]) <= baselines[i])
-                                        {
-                                            allWritten = false;
-                                            break;
-                                        }
-                                    }
-                                    catch { allWritten = false; break; }
-                                }
-                                if (allWritten) break;
-                                System.Threading.Thread.Sleep(100);
-                            }
-                            // Short grace period for trailing writes we're not explicitly watching.
-                            if (allWritten) System.Threading.Thread.Sleep(500);
-                            ExitProcess(0);
-                        });
-                        watchdog.IsBackground = true;
-                        watchdog.Start();
-                    });
-                }
-                else
-                {
-                    Debug.LogWarning("[NativeHookManager] editorApplicationQuit field not found — " +
-                                     "editor close may hang. Force-kill with Task Manager if needed.");
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning("[NativeHookManager] Failed to register quit callback: " + ex.Message);
-            }
         }
 
         public static T ApplyEditorDetour<T>(long from, Delegate to) where T : class
@@ -453,6 +395,12 @@ namespace MeatKit
             IntPtr editorBase = DynDll.OpenLibrary("Unity.exe");
             return Marshal.GetDelegateForFunctionPointer((IntPtr)(editorBase.ToInt64() + from), typeof(T));
         }
+
+        // NOTE: GetCompatibleWithEditorOrAnyPlatform hook not installed.
+        // Its prologue contains RIP-relative instructions that MonoMod copies verbatim to the
+        // trampoline page, causing corrupted memory accesses. The IsCompatibleWithEditorCPUAndOS
+        // hook handles H3VRCode references instead (it calls GetCompatibleWithEditorOrAnyPlatform
+        // internally, so force-returning true for our DLLs achieves the same result).
 
         // NOTE: GetCompatibleWithEditorOrAnyPlatform hook not installed.
         // Its prologue contains RIP-relative instructions that MonoMod copies verbatim to the
@@ -505,11 +453,12 @@ namespace MeatKit
         // caused by stale TypeTrees cached from editor startup or a prior build run.
         private static void OnTransferScriptingObjectGTT(long a1, long a2, long a3, long a4)
         {
-            if (InsideBundleEATI && a4 != 0)
+            if (InsideBundleEATI)
             {
                 try
                 {
-                    Marshal.WriteIntPtr((IntPtr)(a4 + 136), IntPtr.Zero);
+                    if (a4 != 0)
+                        Marshal.WriteIntPtr((IntPtr)(a4 + 136), IntPtr.Zero);
                 }
                 catch { }
             }
@@ -525,12 +474,26 @@ namespace MeatKit
             return _origIsCompatibleWithEditorCPUAndOS(thisPluginImporter, buildTargetGroupName, buildTargetName);
         }
 
+        private static long RVA_IsCompilingFlag = 0x3C70878;
+
+        // No-op: the bundle manifest is already built, so the H3VRCode-less standalone compile must
+        // not block the build. Also clears the IsCompiling flag so shutdown doesn't hang.
         private static byte OnBuildPlayerExtractAndValidateScriptTypes(
             long a1, IntPtr a2, uint platformGroup, uint platform, IntPtr a5, long a6, long a7)
         {
-            // Skip the standalone compile. The bundle manifest was already built before this
-            // call, so returning 1 (success) allows the pipeline to continue normally.
-            return 1; // 1 = success
+            ResetIsCompilingFlag();
+            return 1;
+        }
+
+        private static void ResetIsCompilingFlag()
+        {
+            try
+            {
+                IntPtr unityBase = DynDll.OpenLibrary("Unity.exe");
+                IntPtr flagAddr = (IntPtr)(unityBase.ToInt64() + RVA_IsCompilingFlag);
+                Marshal.WriteInt64(flagAddr, 0);
+            }
+            catch { }
         }
 
         private static byte OnExtractAssemblyTypeInfoAll(int policyIndex, uint assemblyId, byte buildTarget, long typeInfoCollector)
@@ -643,7 +606,7 @@ namespace MeatKit
         // STOA deadlocks because it can't suspend them.  Killing them lets STOA succeed naturally.
         // Safe to call before domain teardown: the domain is about to be unloaded anyway, so
         // thread-held Mono locks become irrelevant.
-        private static void TerminateMonoIOWorkers()
+        internal static void TerminateMonoIOWorkers()
         {
             try
             {
@@ -690,6 +653,102 @@ namespace MeatKit
             catch (Exception ex)
             {
                 Debug.LogWarning("[NativeHookManager] TerminateMonoIOWorkers failed: " + ex.Message);
+            }
+        }
+
+
+
+
+        // NativeDetour objects deadlock Mono's CRT atexit on exit(). Hook editorApplicationQuit and
+        // start a native watchdog that force-kills the process if native shutdown hangs.
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr CreateThread(
+            IntPtr lpThreadAttributes,
+            UIntPtr dwStackSize,
+            IntPtr lpStartAddress,
+            IntPtr lpParameter,
+            uint dwCreationFlags,
+            out uint lpThreadId);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Ansi)]
+        private static extern IntPtr GetProcAddress(IntPtr hModule, string procName);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Ansi)]
+        private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+        [DllImport("kernel32.dll")]
+        private static extern IntPtr VirtualAlloc(IntPtr lpAddress, UIntPtr dwSize, uint flAllocationType, uint flProtect);
+
+        // Unmanaged watchdog thread (x64 machine-code stub in a VirtualAlloc'd RWX page). Managed
+        // threads are suspended by mono's STOA during "Cleanup mono", so the stub uses only kernel32
+        // Sleep/TerminateProcess.
+        private static void StartNativeWatchdog(uint timeoutMs)
+        {
+            try
+            {
+                IntPtr k32 = GetModuleHandle("kernel32.dll");
+                IntPtr sleep = GetProcAddress(k32, "Sleep");
+                IntPtr terminate = GetProcAddress(k32, "TerminateProcess");
+                if (sleep == IntPtr.Zero || terminate == IntPtr.Zero) { return; }
+
+                System.IO.MemoryStream ms = new System.IO.MemoryStream();
+                // mov rcx, (uint)timeoutMs         ; 48 C7 C1 <imm32>
+                ms.Write(new byte[] { 0x48, 0xC7, 0xC1 }, 0, 3);
+                ms.Write(BitConverter.GetBytes(timeoutMs), 0, 4);
+                // mov rax, Sleep                    ; 48 B8 <imm64>
+                ms.Write(new byte[] { 0x48, 0xB8 }, 0, 2);
+                ms.Write(BitConverter.GetBytes(sleep.ToInt64()), 0, 8);
+                // sub rsp,0x28 ; call rax ; add rsp,0x28
+                ms.Write(new byte[] { 0x48, 0x83, 0xEC, 0x28, 0xFF, 0xD0, 0x48, 0x83, 0xC4, 0x28 }, 0, 10);
+                // mov rcx,-1 (GetCurrentProcess pseudo-handle) ; xor edx,edx (exit code 0)
+                ms.Write(new byte[] { 0x48, 0xC7, 0xC1, 0xFF, 0xFF, 0xFF, 0xFF, 0x33, 0xD2 }, 0, 9);
+                // mov rax, TerminateProcess
+                ms.Write(new byte[] { 0x48, 0xB8 }, 0, 2);
+                ms.Write(BitConverter.GetBytes(terminate.ToInt64()), 0, 8);
+                // sub rsp,0x28 ; call rax ; add rsp,0x28 ; xor eax,eax ; ret
+                ms.Write(new byte[] { 0x48, 0x83, 0xEC, 0x28, 0xFF, 0xD0, 0x48, 0x83, 0xC4, 0x28, 0x33, 0xC0, 0xC3 }, 0, 13);
+                byte[] code = ms.ToArray();
+
+                IntPtr exec = VirtualAlloc(IntPtr.Zero, (UIntPtr)code.Length, 0x3000, 0x40);
+                if (exec == IntPtr.Zero) { return; }
+                System.Runtime.InteropServices.Marshal.Copy(code, 0, exec, code.Length);
+                uint tid;
+                CreateThread(IntPtr.Zero, UIntPtr.Zero, exec, IntPtr.Zero, 0, out tid);
+            }
+            catch { }
+        }
+
+        private static void RegisterQuitCallback()
+        {
+            try
+            {
+                var field = typeof(EditorApplication).GetField(
+                    "editorApplicationQuit",
+                    System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic);
+                if (field != null)
+                {
+                    var existing = (UnityEngine.Events.UnityAction)field.GetValue(null);
+                    field.SetValue(null, (UnityEngine.Events.UnityAction)delegate
+                    {
+                        if (existing != null)
+                        {
+                            try { existing(); }
+                            catch { }
+                        }
+
+                        // Force-kill if native shutdown hangs (managed threads are suspended by STOA).
+                        StartNativeWatchdog(5000);
+                    });
+                }
+                else
+                {
+                    Debug.LogWarning("[NativeHookManager] editorApplicationQuit field not found — " +
+                                     "editor close may hang. Force-kill with Task Manager if needed.");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("[NativeHookManager] Failed to register quit callback: " + ex.Message);
             }
         }
     }
