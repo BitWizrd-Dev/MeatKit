@@ -161,19 +161,9 @@ namespace MeatKit
                 NativeHookManager.InsideEATI = true;
                 // Block ALL Assets/Managed/ DLLs during bundle build (cleared after)
                 NativeHookManager.InsideBundleEATI = true;
-                // Re-prime MonoBehaviour caches so EATI generates TypeTrees from full H3VRCode
-                ManagedPluginDomainFix.ReprimeMBCachesBeforeEATI();
-
-            };
-
-            Action _afterEATI = delegate
-            {
-                // Re-prime m_ScriptCache after EATI resets it
-                ManagedPluginDomainFix.ReprimeSilentAfterEATI();
             };
 
             NativeHookManager.BeforeEATICallbacks.Add(_beforeEATI);
-            NativeHookManager.AfterEATICallbacks.Add(_afterEATI);
 
             BuildLog.WriteLine("Calling BuildAssetBundles (isCompiling=" + EditorApplication.isCompiling + " InsideEATI=" + NativeHookManager.InsideEATI + ")");
             var bundleManifest = BuildPipeline.BuildAssetBundles(bundleOutputPath, bundles,
@@ -181,9 +171,8 @@ namespace MeatKit
                 BuildTarget.StandaloneWindows64);
             BuildLog.WriteLine("BuildAssetBundles returned. manifest=" + (bundleManifest != null ? "OK" : "NULL") + " isCompiling=" + EditorApplication.isCompiling);
 
-            // Unregister EATI callbacks
+            // Unregister EATI callback
             NativeHookManager.BeforeEATICallbacks.Remove(_beforeEATI);
-            NativeHookManager.AfterEATICallbacks.Remove(_afterEATI);
             // InsideEATI must be reset on every exit path, including success — the flag it gates
             // (IsFileCreated) has many unrelated callers, so leaving it true would keep blocking
             // H3VRCode for the rest of the process.

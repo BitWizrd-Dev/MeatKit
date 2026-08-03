@@ -126,16 +126,6 @@ namespace MeatKit
             return false;
         }
 
-        public static List<MethodDefinition> FindMethodsReferencingTypes(AssemblyDefinition assembly, string[] typeNames)
-        {
-            // Use a HashSet to accumulate without duplicates (avoids Distinct() LINQ call).
-            var seen = new HashSet<MethodDefinition>();
-            foreach (var typeName in typeNames)
-                foreach (var method in FindMethodsReferencingType(assembly, typeName))
-                    seen.Add(method);
-            return new List<MethodDefinition>(seen);
-        }
-
         public static List<FieldDefinition> FindFieldsReferencingType(AssemblyDefinition assembly, string typeName)
         {
             var result = new List<FieldDefinition>();
@@ -147,29 +137,6 @@ namespace MeatKit
                     if (field == null) continue;
                     if (field.FieldType != null && field.FieldType.FullName == typeName) result.Add(field);
                 }
-            }
-            return result;
-        }
-
-        public static List<FieldDefinition> FindFieldsReferencingTypes(AssemblyDefinition assembly, string[] typeNames)
-        {
-            var seen = new HashSet<FieldDefinition>();
-            foreach (var typeName in typeNames)
-                foreach (var field in FindFieldsReferencingType(assembly, typeName))
-                    seen.Add(field);
-            return new List<FieldDefinition>(seen);
-        }
-
-        public static List<TypeDefinition> FindTypesReferencingType(AssemblyDefinition assembly, string typeName)
-        {
-            var result = new List<TypeDefinition>();
-            foreach (var type in assembly.MainModule.Types)
-            {
-                if (type == null) continue;
-                if (type.BaseType != null && type.BaseType.FullName == typeName) { result.Add(type); continue; }
-                if (type.Interfaces != null)
-                    foreach (var iface in type.Interfaces)
-                        if (iface.InterfaceType != null && iface.InterfaceType.FullName == typeName) { result.Add(type); break; }
             }
             return result;
         }
@@ -274,11 +241,6 @@ namespace MeatKit
             }
             foreach (var reference in assembly.MainModule.AssemblyReferences)
                 if (reference == null) result.Errors.Add("Assembly contains null assembly reference");
-        }
-
-        public static bool CanSafelyWriteAssembly(AssemblyDefinition assembly)
-        {
-            return ValidateAssemblyIntegrity(assembly).IsValid;
         }
     }
 
@@ -504,9 +466,6 @@ namespace MeatKit
             Errors = new List<string>();
         }
 
-        public bool HasErrors { get { return Errors.Count > 0; } }
-        public bool IsSuccessful { get { return !HasErrors; } }
         public string GetSummary() { return "Stripped " + StrippedTypes.Count + " types, removed " + RemovedMethods.Count + " methods, removed " + RemovedFields.Count + " fields"; }
-        public string GetErrorString() { return string.Join("; ", Errors.ToArray()); }
     }
 }

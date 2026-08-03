@@ -80,9 +80,6 @@ namespace MeatKit
 
         private static d_GetClass _origGetClass;
 
-        /// <summary>True when the MonoScript::GetClass hook is installed.</summary>
-        internal static bool GetClassHookInstalled { get { return _origGetClass != null; } }
-
         // MonoBehaviour::GetClass(MonoBehaviour*, ScriptingClassPtr* resultOut) — RVA 0x14BC7B0.
         // Returns *(MB+160 cache)+8. Guarded to return 0 when that class is a stale/freed old-domain
         // pointer, which would crash reload step 7 and the Inspector.
@@ -127,21 +124,24 @@ namespace MeatKit
         private static d_GetMonoClassWithAssemblyName _origGetMonoClassWithAssemblyName;
 
         // Native MonoScript / MonoScriptCache offsets (Unity 5.6.7f1 x64, IDA-verified).
-        private const int MonoScriptCacheOffset = 216; // MonoScript::m_ScriptCache
-        private const int CacheClassOffset      = 8;   // MonoScriptCache::m_pClass
+        private const int MonoScriptCacheOffset        = 216;  // MonoScript::m_ScriptCache
+        private const int CacheClassOffset             = 8;    // MonoScriptCache::m_pClass
+        private const int MonoScriptClassNameOffset    = 0xE0;  // MonoScript className (core::basic_string)
+        private const int MonoScriptNamespaceOffset    = 0x110; // MonoScript namespace
+        private const int MonoScriptAssemblyNameOffset = 0x140; // MonoScript assemblyName
+        private const int MonoBehaviourScriptIdOffset  = 0x68;  // MonoBehaviour::m_Script PPtr<MonoScript> instance id
+        private const int MonoBehaviourScriptingCache  = 0xA0;  // MonoBehaviour+160 scripting cache
+        private const int MonoManagerImageTableData    = 0x208; // MonoManager image table data pointer
+        private const int MonoManagerImageTableEnd     = 0x210; // MonoManager image table end pointer
 
-        // ReprimeMBCachesBeforeEATI / ReprimeSilentAfterEATI (restored from MeatKit-main) are
-        // deliberately no-ops: their reflection (FindObjectsOfTypeAll + GetValue) hard-faults on the
-        // post-build corrupt MonoScript state. Cache repair is handled by RepairBrokenMonoScriptClasses.
-        internal static void ReprimeMBCachesBeforeEATI()
-        {
-            return;
-        }
-
-        internal static void ReprimeSilentAfterEATI()
-        {
-            return;
-        }
+        // Native function RVAs (Unity 5.6.7f1 x64, IDA-verified).
+        private const long RVA_GetMonoManagerPtr              = 0x14C2510;
+        private const long RVA_RenewMonoScriptsFromAssemblies = 0x14C6910;
+        private const long RVA_GetMonoClassWithAssemblyName   = 0x14C32E0;
+        private const long RVA_MonoBehaviourGetClass          = 0x14BC7B0;
+        private const long RVA_CallMethodInactive             = 0x14BC9E0;
+        private const long RVA_BuildSerializationCacheFor     = 0xE4BD30;
+        private const long RVA_ObjectReferenceValue           = 0x1386D30;
 
         // --- CheckTypeSerializable gate byte patch ---
         // RVA in MonoManager_CheckTypeSerializable where GetAssemblyIndexFromImage result is checked.
@@ -149,7 +149,6 @@ namespace MeatKit
         private const long RVA_GatePatchSite = 0xE3F6D5;
         private static readonly byte[] GateOrigBytes = new byte[] { 0x83, 0xF8, 0xFF, 0x0F, 0x95, 0xC0 };
         private static readonly byte[] GatePatchBytes = new byte[] { 0xB0, 0x01, 0x90, 0x90, 0x90, 0x90 };
-        private static bool _gatePatchApplied = false;
 
         // --- SetupScriptingCache early-exit NOP patch ---
         // MonoBehaviour::SetupScriptingCache (RVA 0x14BE350) sets MB+160 from the MonoScript's
@@ -159,7 +158,6 @@ namespace MeatKit
         private const long RVA_SetupScriptingCacheEarlyExit = 0x14BE38F;
         private static readonly byte[] SSCacheOrigBytes = new byte[] { 0x0F, 0x85, 0x42, 0x02, 0x00, 0x00 };
         private static readonly byte[] SSCachePatchBytes = new byte[] { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
-        private static bool _ssCachePatchApplied = false;
 
         // True from EndReloadAssembly step 5 until RepairBrokenMonoScriptClasses completes at OnDomainLoad.
         private static volatile bool _insideReload = false;
@@ -172,15 +170,14 @@ namespace MeatKit
         {
             try
             {
-                var getMonoManagerFn = (d_GetMonoManagerPtr)NativeHookManager.GetDelegateForFunctionPointer<d_GetMonoManagerPtr>(0x14C2510);
-                var renewFn = (d_RenewMonoScriptsFromAssemblies)NativeHookManager.GetDelegateForFunctionPointer<d_RenewMonoScriptsFromAssemblies>(0x14C6910);
-                if (getMonoManagerFn == null || renewFn == null)
+                var renewFn = (d_RenewMonoScriptsFromAssemblies)NativeHookManager.GetDelegateForFunctionPointer<d_RenewMonoScriptsFromAssemblies>(RVA_RenewMonoScriptsFromAssemblies);
+                if (renewFn == null)
                 {
                     Debug.LogError("[ManagedPluginDomainFix] RepairBrokenMonoScriptClasses: failed to resolve native functions");
                     return;
                 }
 
-                IntPtr monoManager = getMonoManagerFn();
+                IntPtr monoManager = GetMonoManagerSafe();
                 if (monoManager == IntPtr.Zero)
                 {
                     Debug.LogError("[ManagedPluginDomainFix] RepairBrokenMonoScriptClasses: MonoManager is NULL");
@@ -218,12 +215,20 @@ namespace MeatKit
         }
 
 
+        // Cached mono.dll base so the garbage-class guards don't hit OpenLibrary on every call.
+        private static IntPtr _monoBase;
+        private static IntPtr MonoBase()
+        {
+            if (_monoBase == IntPtr.Zero) _monoBase = DynDll.OpenLibrary("mono.dll");
+            return _monoBase;
+        }
+
         // Heuristic: is this pointer obviously not a live MonoClass? Pure memory reads, no deref.
         private static bool IsGarbageClassPtr(long cls)
         {
             if (cls == 0) return true;
             if (cls >= 0x0000000100000000L && cls < 0x100000000L) return true; // low code/JIT range
-            IntPtr monoBase = DynDll.OpenLibrary("mono.dll");
+            IntPtr monoBase = MonoBase();
             if (monoBase != IntPtr.Zero &&
                 cls >= monoBase.ToInt64() && cls < monoBase.ToInt64() + (16L * 1024 * 1024)) return true; // &builtin_types[0]
             return false;
@@ -259,12 +264,29 @@ namespace MeatKit
                     IntPtr basePtr = DynDll.OpenLibrary("Unity.exe");
                     if (basePtr != IntPtr.Zero)
                         _getMonoManagerCached = (d_GetMonoManagerPtr)Marshal.GetDelegateForFunctionPointer(
-                            (IntPtr)(basePtr.ToInt64() + 0x14C2510), typeof(d_GetMonoManagerPtr));
+                            (IntPtr)(basePtr.ToInt64() + RVA_GetMonoManagerPtr), typeof(d_GetMonoManagerPtr));
                 }
                 catch { _getMonoManagerCached = null; }
             }
             if (_getMonoManagerCached == null) return IntPtr.Zero;
             try { return _getMonoManagerCached(); } catch { return IntPtr.Zero; }
+        }
+
+        // True when 'image' is present in MonoManager's current image table. A class whose MonoImage
+        // is missing from this table is stale (freed old-domain) and unsafe to use.
+        private static bool IsImageInMonoManager(IntPtr image)
+        {
+            IntPtr mgr = GetMonoManagerSafe();
+            if (mgr == IntPtr.Zero) return true; // can't verify — don't block
+            IntPtr imgData = Marshal.ReadIntPtr(mgr, MonoManagerImageTableData);
+            IntPtr imgEnd = Marshal.ReadIntPtr(mgr, MonoManagerImageTableEnd);
+            long imgN = (imgEnd != IntPtr.Zero && imgData != IntPtr.Zero)
+                ? (imgEnd.ToInt64() - imgData.ToInt64()) / 8 : 0;
+            if (imgN <= 0 || imgN >= 10000) return false; // malformed table — treat as stale
+            long target = image.ToInt64();
+            for (long i = 0; i < imgN; i++)
+                if (Marshal.ReadInt64(imgData, (int)(i * 8)) == target) return true;
+            return false;
         }
 
         // Guard BuildSerializationCacheFor: return the NULL-class cache for stale/garbage classes
@@ -282,27 +304,8 @@ namespace MeatKit
             try
             {
                 IntPtr img = MonoClassGetImage(classPtr);
-                if (img != IntPtr.Zero)
-                {
-                    IntPtr mgr = GetMonoManagerSafe();
-                    if (mgr != IntPtr.Zero)
-                    {
-                        IntPtr imgData = Marshal.ReadIntPtr(mgr, 0x208);
-                        IntPtr imgEnd = Marshal.ReadIntPtr(mgr, 0x210);
-                        long imgN = (imgEnd != IntPtr.Zero && imgData != IntPtr.Zero)
-                            ? (imgEnd.ToInt64() - imgData.ToInt64()) / 8 : 0;
-                        long imgVal = img.ToInt64();
-                        bool found = false;
-                        if (imgN > 0 && imgN < 10000)
-                        {
-                            for (long i = 0; i < imgN; i++)
-                            {
-                                if (Marshal.ReadInt64(imgData, (int)(i * 8)) == imgVal) { found = true; break; }
-                            }
-                        }
-                        if (!found) return _origBuildSerializationCacheFor(IntPtr.Zero, createFlags);
-                    }
-                }
+                if (img != IntPtr.Zero && !IsImageInMonoManager(img))
+                    return _origBuildSerializationCacheFor(IntPtr.Zero, createFlags);
             }
             catch { }
             return _origBuildSerializationCacheFor(classPtr, createFlags);
@@ -314,7 +317,7 @@ namespace MeatKit
         {
             IntPtr wrapper = _origObjectReferenceValue(prop);
             if (wrapper == IntPtr.Zero) return wrapper;
-            if (_insideReload || NativeHookManager.BuildInProgress || NativeHookManager.InsideBundleEATI) return wrapper;
+            if (_insideReload || NativeHookManager.InsideBundleEATI) return wrapper;
             try
             {
                 IntPtr vtable = Marshal.ReadIntPtr(wrapper, 0);
@@ -324,37 +327,15 @@ namespace MeatKit
                     return IntPtr.Zero;
                 }
                 IntPtr klass = Marshal.ReadIntPtr(vtable, 0);
-                long k = klass.ToInt64();
-                if (IsGarbageClassPtr(k))
+                if (IsGarbageClassPtr(klass.ToInt64()))
                 {
                     // Stale wrapper: garbage klass -> mono_class_init would AV. Return null.
                     return IntPtr.Zero;
                 }
                 // A freed old-domain class's MonoImage is gone from MonoManager's image table -> stale.
-                try
-                {
-                    IntPtr image = MonoClassGetImage(klass);
-                    if (image == IntPtr.Zero) return IntPtr.Zero;
-                    IntPtr mgr = GetMonoManagerSafe();
-                    if (mgr != IntPtr.Zero)
-                    {
-                        IntPtr imgData = Marshal.ReadIntPtr(mgr, 0x208);
-                        IntPtr imgEnd = Marshal.ReadIntPtr(mgr, 0x210);
-                        long imgN = (imgEnd != IntPtr.Zero && imgData != IntPtr.Zero)
-                            ? (imgEnd.ToInt64() - imgData.ToInt64()) / 8 : 0;
-                        long img = image.ToInt64();
-                        bool found = false;
-                        if (imgN > 0 && imgN < 10000)
-                        {
-                            for (long i = 0; i < imgN; i++)
-                            {
-                                if (Marshal.ReadInt64(imgData, (int)(i * 8)) == img) { found = true; break; }
-                            }
-                        }
-                        if (!found) return IntPtr.Zero; // image not current -> stale class
-                    }
-                }
-                catch { }
+                IntPtr image = MonoClassGetImage(klass);
+                if (image == IntPtr.Zero) return IntPtr.Zero;
+                if (!IsImageInMonoManager(image)) return IntPtr.Zero; // image not current -> stale class
             }
             catch { }
             return wrapper;
@@ -366,24 +347,11 @@ namespace MeatKit
             // Return 0 (safe 'missing script') when the class is garbage: null, in mono.dll's image
             // (&builtin_types[0]), or in the low JIT/code region. Prevents the crash at reload step 7
             // and Inspector time.
-            try
+            if (ret != IntPtr.Zero && IsGarbageClassPtr(ret.ToInt64()))
             {
-                if (ret != IntPtr.Zero)
-                {
-                    long cls = ret.ToInt64();
-                    bool bad = false;
-                    IntPtr monoBase = DynDll.OpenLibrary("mono.dll");
-                    if (cls >= 0x0000000100000000L && cls < 0x100000000L) bad = true;          // low code/JIT range
-                    if (monoBase != IntPtr.Zero &&
-                        cls >= monoBase.ToInt64() && cls < monoBase.ToInt64() + (16L * 1024 * 1024)) bad = true; // &builtin_types[0]
-                    if (bad)
-                    {
-                        Marshal.WriteInt64(resultOut, 0);
-                        return resultOut;
-                    }
-                }
+                Marshal.WriteInt64(resultOut, 0);
+                return resultOut;
             }
-            catch { }
             return ret;
         }
 
@@ -394,19 +362,11 @@ namespace MeatKit
             {
                 if (thisMB != IntPtr.Zero)
                 {
-                    IntPtr cache = Marshal.ReadIntPtr(thisMB, 0xA0); // MB+160
+                    IntPtr cache = Marshal.ReadIntPtr(thisMB, MonoBehaviourScriptingCache); // MB+160
                     if (cache != IntPtr.Zero)
                     {
-                        long cls = Marshal.ReadInt64((IntPtr)(cache.ToInt64() + 8)); // cache+8
-                        bool bad = (cls == 0);
-                        if (!bad)
-                        {
-                            IntPtr monoBase = DynDll.OpenLibrary("mono.dll");
-                            if (cls >= 0x0000000100000000L && cls < 0x100000000L) bad = true;
-                            if (monoBase != IntPtr.Zero &&
-                                cls >= monoBase.ToInt64() && cls < monoBase.ToInt64() + (16L * 1024 * 1024)) bad = true;
-                        }
-                        if (bad)
+                        long cls = Marshal.ReadInt64((IntPtr)(cache.ToInt64() + CacheClassOffset)); // cache+8
+                        if (IsGarbageClassPtr(cls))
                             return 1; // skip the invoke — reload must survive
                     }
                 }
@@ -447,12 +407,10 @@ namespace MeatKit
         {
             try
             {
-                var getMonoManager = (d_GetMonoManagerPtr)NativeHookManager.GetDelegateForFunctionPointer<d_GetMonoManagerPtr>(0x14C2510);
-                if (getMonoManager == null) return;
-                IntPtr mgr = getMonoManager();
+                IntPtr mgr = GetMonoManagerSafe();
                 if (mgr == IntPtr.Zero) return;
 
-                var gmcawn = (d_GetMonoClassWithAssemblyNameCdecl)NativeHookManager.GetDelegateForFunctionPointer<d_GetMonoClassWithAssemblyNameCdecl>(0x14C32E0);
+                var gmcawn = (d_GetMonoClassWithAssemblyNameCdecl)NativeHookManager.GetDelegateForFunctionPointer<d_GetMonoClassWithAssemblyNameCdecl>(RVA_GetMonoClassWithAssemblyName);
                 var findMBs = (d_FindInstanceIDsOfType)NativeHookManager.GetDelegateForFunctionPointer<d_FindInstanceIDsOfType>(0x91E8D0);
                 var getObjById = (d_GetObjectFromInstanceId)NativeHookManager.GetDelegateForFunctionPointer<d_GetObjectFromInstanceId>(0xAB9BB0);
                 if (gmcawn == null || findMBs == null || getObjById == null) return;
@@ -479,7 +437,6 @@ namespace MeatKit
                     }
 
                     var repairedMs = new HashSet<long>();
-                    int repaired = 0, checkedCount = 0, alreadyValid = 0, unresolved = 0, badCache = 0;
                     for (long i = 0; i < mbCount; i++)
                     {
                         int mbId = Marshal.ReadInt32(mbDataBuf, (int)(i * 4));
@@ -488,7 +445,7 @@ namespace MeatKit
                         if (mb == IntPtr.Zero) continue;
 
                         // m_Script PPtr<MonoScript> at MB+0x68 (104): a 4-byte instance ID.
-                        int msId = Marshal.ReadInt32(mb, 0x68);
+                        int msId = Marshal.ReadInt32(mb, MonoBehaviourScriptIdOffset);
                         if (msId == 0) continue;
                         IntPtr ms = getObjById(msId);
                         if (ms == IntPtr.Zero) continue;
@@ -499,44 +456,35 @@ namespace MeatKit
                         IntPtr cache = Marshal.ReadIntPtr(ms, MonoScriptCacheOffset); // +216
                         long cls = 0;
                         if (cache != IntPtr.Zero) cls = Marshal.ReadInt64((IntPtr)(cache.ToInt64() + CacheClassOffset)); // +8
-                        checkedCount++;
                         bool garbage = IsGarbageClassPtr(cls);
 
                         // A cache+8 class can pass the range check yet still be stale (old-domain image).
                         // GetMonoClassWithAssemblyName is the authoritative class; renew if they differ.
-                        string className = UnityNativeHelper.ReadNativeString(ms, 0xE0);
-                        if (string.IsNullOrEmpty(className)) { unresolved++; continue; }
+                        string className = UnityNativeHelper.ReadNativeString(ms, MonoScriptClassNameOffset);
+                        if (string.IsNullOrEmpty(className)) continue;
 
                         long resolved = gmcawn(
                             mgr,
-                            new IntPtr(msKey + 0xE0),    // className
-                            new IntPtr(msKey + 0x110),   // namespace
-                            new IntPtr(msKey + 0x140));  // assemblyName
+                            new IntPtr(msKey + MonoScriptClassNameOffset),
+                            new IntPtr(msKey + MonoScriptNamespaceOffset),
+                            new IntPtr(msKey + MonoScriptAssemblyNameOffset));
 
                         bool stale = false;
                         if (resolved == 0)
                         {
-                            // Assembly not resolvable in the current MonoManager image table. If the cache
-                            // class is already garbage, treat as broken; otherwise leave it (cannot verify).
-                            if (garbage) { badCache++; }
-                            else { alreadyValid++; }
-                            unresolved++;
+                            // Assembly not resolvable in the current MonoManager image table — cannot
+                            // verify staleness, so leave the cache as-is.
                             continue;
                         }
                         if (garbage) { stale = true; }
                         else if (cls != resolved) { stale = true; }
 
                         if (!stale)
-                        {
-                            alreadyValid++;
                             continue;
-                        }
-                        badCache++;
                         Marshal.WriteInt64(ms, MonoScriptCacheOffset, 0); // clear +216 (avoid Renew assert)
                         Marshal.WriteInt64(ms, 200, 0);                    // zero PropertiesHash lo
                         Marshal.WriteInt64(ms, 208, 0);                    // zero PropertiesHash hi
                         _origMonoScriptRenew(msKey, resolved);
-                        repaired++;
                     }
                 }
                 finally
@@ -548,6 +496,50 @@ namespace MeatKit
             catch (Exception ex)
             {
                 Debug.LogWarning("[ManagedPluginDomainFix] RepairSceneMonoScriptClasses failed: " + ex.Message);
+            }
+        }
+
+        // Re-primes a single MonoScript's cache during bundle serialization (called from
+        // AssetBundleIO.OnMonoScriptTransferWrite BEFORE any assembly-name rewrite). Resolves the
+        // class via GetMonoClassWithAssemblyName using the still-original assembly name, then Renews
+        // if the cache is stale — so the TypeTree survives the subsequent rename.
+        internal static void ReprimeSingleNativeScript(IntPtr monoScript)
+        {
+            if (monoScript == IntPtr.Zero || _origMonoScriptRenew == null) return;
+            try
+            {
+                IntPtr mgr = GetMonoManagerSafe();
+                if (mgr == IntPtr.Zero) return;
+
+                var gmcawn = (d_GetMonoClassWithAssemblyNameCdecl)NativeHookManager.GetDelegateForFunctionPointer<d_GetMonoClassWithAssemblyNameCdecl>(RVA_GetMonoClassWithAssemblyName);
+                if (gmcawn == null) return;
+
+                long msKey = monoScript.ToInt64();
+                string className = UnityNativeHelper.ReadNativeString(monoScript, MonoScriptClassNameOffset);
+                if (string.IsNullOrEmpty(className)) return;
+
+                long resolved = gmcawn(
+                    mgr,
+                    new IntPtr(msKey + MonoScriptClassNameOffset),
+                    new IntPtr(msKey + MonoScriptNamespaceOffset),
+                    new IntPtr(msKey + MonoScriptAssemblyNameOffset));
+                if (resolved == 0) return;
+
+                // Skip if the cache is already valid.
+                IntPtr cache = Marshal.ReadIntPtr(monoScript, MonoScriptCacheOffset);
+                long cls = 0;
+                if (cache != IntPtr.Zero) cls = Marshal.ReadInt64((IntPtr)(cache.ToInt64() + CacheClassOffset));
+                if (!IsGarbageClassPtr(cls) && cls == resolved) return;
+
+                // Clear +216 and PropertiesHash (avoid Renew's assert), then Renew.
+                Marshal.WriteInt64(monoScript, MonoScriptCacheOffset, 0);
+                Marshal.WriteInt64(monoScript, 200, 0);
+                Marshal.WriteInt64(monoScript, 208, 0);
+                _origMonoScriptRenew(msKey, resolved);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning("[ManagedPluginDomainFix] ReprimeSingleNativeScript failed: " + ex.Message);
             }
         }
 
@@ -925,83 +917,43 @@ namespace MeatKit
         [DllImport("kernel32.dll")]
         private static extern IntPtr GetCurrentProcess();
 
-        private static void ApplyCheckTypeSerializablePatch()
+        private static bool ByteArrayEquals(byte[] a, byte[] b)
         {
-            if (_gatePatchApplied) return;
-            try
-            {
-                IntPtr unityBase = DynDll.OpenLibrary("Unity.exe");
-                IntPtr patchAddr = (IntPtr)(unityBase.ToInt64() + RVA_GatePatchSite);
-
-                byte[] current = new byte[6];
-                Marshal.Copy(patchAddr, current, 0, 6);
-                bool match = true;
-                for (int i = 0; i < 6; i++)
-                {
-                    if (current[i] != GateOrigBytes[i]) { match = false; break; }
-                }
-
-                if (!match)
-                {
-                    bool already = true;
-                    for (int i = 0; i < 6; i++)
-                        if (current[i] != GatePatchBytes[i]) { already = false; break; }
-                    if (already) { _gatePatchApplied = true; return; }
-                    Debug.LogWarning("[ManagedPluginDomainFix] CheckTypeSerializable: unexpected bytes at patch site — skipping");
-                    return;
-                }
-
-                uint oldProtect;
-                if (!VirtualProtect(patchAddr, (UIntPtr)6, 0x40, out oldProtect)) return;
-                Marshal.Copy(GatePatchBytes, 0, patchAddr, 6);
-                uint ignored;
-                VirtualProtect(patchAddr, (UIntPtr)6, oldProtect, out ignored);
-                FlushInstructionCache(GetCurrentProcess(), patchAddr, (UIntPtr)6);
-                _gatePatchApplied = true;
-            }
-            catch (Exception ex)
-            {
-                Debug.LogWarning("[ManagedPluginDomainFix] ApplyCheckTypeSerializablePatch: " + ex.Message);
-            }
+            if (a == null || b == null || a.Length != b.Length) return false;
+            for (int i = 0; i < a.Length; i++)
+                if (a[i] != b[i]) return false;
+            return true;
         }
 
-        // Applies the SetupScriptingCache early-exit NOP patch (see constants above). Refuses to
-        // patch if the current bytes don't match the expected originals (wrong binary/version).
-        private static void ApplySetupScriptingCachePatch()
+        // Applies a byte patch at RVA after verifying the site still matches 'expected'. Refuses to
+        // patch if the bytes differ (wrong binary/version); no-ops if the patch is already applied.
+        private static void ApplyBytePatch(long rva, byte[] expected, byte[] replacement, string name)
         {
-            if (_ssCachePatchApplied) return;
             try
             {
                 IntPtr unityBase = DynDll.OpenLibrary("Unity.exe");
-                IntPtr patchAddr = (IntPtr)(unityBase.ToInt64() + RVA_SetupScriptingCacheEarlyExit);
+                IntPtr patchAddr = (IntPtr)(unityBase.ToInt64() + rva);
 
-                byte[] current = new byte[6];
-                Marshal.Copy(patchAddr, current, 0, 6);
-                bool match = true;
-                for (int i = 0; i < 6; i++)
-                    if (current[i] != SSCacheOrigBytes[i]) { match = false; break; }
+                byte[] current = new byte[replacement.Length];
+                Marshal.Copy(patchAddr, current, 0, replacement.Length);
 
-                if (!match)
+                if (!ByteArrayEquals(current, expected))
                 {
-                    bool already = true;
-                    for (int i = 0; i < 6; i++)
-                        if (current[i] != SSCachePatchBytes[i]) { already = false; break; }
-                    if (already) { _ssCachePatchApplied = true; return; }
-                    Debug.LogWarning("[ManagedPluginDomainFix] SetupScriptingCache: unexpected bytes at patch site - skipping");
+                    if (ByteArrayEquals(current, replacement)) return; // already applied
+                    Debug.LogWarning("[ManagedPluginDomainFix] " + name + ": unexpected bytes at patch site — skipping");
                     return;
                 }
 
                 uint oldProtect;
-                if (!VirtualProtect(patchAddr, (UIntPtr)6, 0x40, out oldProtect)) return;
-                Marshal.Copy(SSCachePatchBytes, 0, patchAddr, 6);
+                if (!VirtualProtect(patchAddr, (UIntPtr)replacement.Length, 0x40, out oldProtect)) return;
+                Marshal.Copy(replacement, 0, patchAddr, replacement.Length);
                 uint ignored;
-                VirtualProtect(patchAddr, (UIntPtr)6, oldProtect, out ignored);
-                FlushInstructionCache(GetCurrentProcess(), patchAddr, (UIntPtr)6);
-                _ssCachePatchApplied = true;
+                VirtualProtect(patchAddr, (UIntPtr)replacement.Length, oldProtect, out ignored);
+                FlushInstructionCache(GetCurrentProcess(), patchAddr, (UIntPtr)replacement.Length);
             }
             catch (Exception ex)
             {
-                Debug.LogWarning("[ManagedPluginDomainFix] ApplySetupScriptingCachePatch: " + ex.Message);
+                Debug.LogWarning("[ManagedPluginDomainFix] " + name + ": " + ex.Message);
             }
         }
 
@@ -1032,7 +984,7 @@ namespace MeatKit
                 try
                 {
                     _origMonoBehaviourGetClass = NativeHookManager.ApplyEditorDetour<d_MonoBehaviourGetClass>(
-                        0x14BC7B0,
+                        RVA_MonoBehaviourGetClass,
                         new d_MonoBehaviourGetClass(OnMonoBehaviourGetClass));
                 }
                 catch (Exception ex)
@@ -1044,7 +996,7 @@ namespace MeatKit
                 try
                 {
                     _origCallMethodInactive = NativeHookManager.ApplyEditorDetour<d_CallMethodInactive>(
-                        0x14BC9E0,
+                        RVA_CallMethodInactive,
                         new d_CallMethodInactive(OnCallMethodInactive));
                 }
                 catch (Exception ex)
@@ -1074,7 +1026,7 @@ namespace MeatKit
             try
             {
                 _origGetMonoClassWithAssemblyName = NativeHookManager.ApplyEditorDetour<d_GetMonoClassWithAssemblyName>(
-                    0x14C32E0,
+                    RVA_GetMonoClassWithAssemblyName,
                     new d_GetMonoClassWithAssemblyName(OnGetMonoClassWithAssemblyName));
             }
             catch (Exception ex)
@@ -1086,7 +1038,7 @@ namespace MeatKit
             try
             {
                 _origBuildSerializationCacheFor = NativeHookManager.ApplyEditorDetour<d_BuildSerializationCacheFor>(
-                    0xE4BD30,
+                    RVA_BuildSerializationCacheFor,
                     new d_BuildSerializationCacheFor(OnBuildSerializationCacheFor));
             }
             catch (Exception ex)
@@ -1099,7 +1051,7 @@ namespace MeatKit
             try
             {
                 _origObjectReferenceValue = NativeHookManager.ApplyEditorDetour<d_ObjectReferenceValue>(
-                    0x1386D30,
+                    RVA_ObjectReferenceValue,
                     new d_ObjectReferenceValue(OnObjectReferenceValue));
             }
             catch (Exception ex)
@@ -1108,14 +1060,12 @@ namespace MeatKit
             }
 
             // Apply the CheckTypeSerializable gate patch immediately (process-lifetime code section
-            // patch, no domain dependencies). Wrapped in try/catch so failures don't break the ctor.
-            try { ApplyCheckTypeSerializablePatch(); }
-            catch (Exception ex) { Debug.LogWarning("[ManagedPluginDomainFix] Gate patch failed: " + ex.Message); }
+            // patch, no domain dependencies).
+            ApplyBytePatch(RVA_GatePatchSite, GateOrigBytes, GatePatchBytes, "CheckTypeSerializable gate");
 
             // NOP the SetupScriptingCache early-exit so MB+160 always rebuilds from the current
             // MonoScript cache (prevents the stale-domain MB+160 crash during the post-build reload).
-            try { ApplySetupScriptingCachePatch(); }
-            catch (Exception ex) { Debug.LogWarning("[ManagedPluginDomainFix] SetupScriptingCache patch failed: " + ex.Message); }
+            ApplyBytePatch(RVA_SetupScriptingCacheEarlyExit, SSCacheOrigBytes, SSCachePatchBytes, "SetupScriptingCache early-exit");
         }
 
     }

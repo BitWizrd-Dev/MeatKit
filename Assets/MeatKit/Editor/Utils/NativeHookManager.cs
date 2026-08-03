@@ -28,12 +28,8 @@ namespace MeatKit
 
         private static ExtractAssemblyTypeInfoAllDelegate _origEATI;
 
-        /// <summary>True when the ExtractAssemblyTypeInfoAll native hook was successfully installed.</summary>
-        internal static bool EATIHookInstalled { get { return _origEATI != null; } }
-
-        // Fired before/after EATI runs; safe to modify from main thread
+        // Fired before EATI runs; safe to modify from main thread
         internal static readonly List<Action> BeforeEATICallbacks = new List<Action>();
-        internal static readonly List<Action> AfterEATICallbacks = new List<Action>();
 
         // Gates EATI per-assembly; return false to skip TypeTree extraction for that DLL.
         // Hooked to block H3VRCode re-extraction during builds (when InsideEATI is true).
@@ -41,9 +37,6 @@ namespace MeatKit
         private delegate byte AssemblyHasValidTypeInfoDelegate(long a1);
 
         private static AssemblyHasValidTypeInfoDelegate _origAHVTI;
-
-        /// <summary>True when the AssemblyHasValidTypeInfo native hook was successfully installed.</summary>
-        internal static bool AHVTIHookInstalled { get { return _origAHVTI != null; } }
 
         // Post-bundle standalone script compile step; made a no-op during MeatKit builds to prevent
         // H3VRCode compile failure (it's absent from the freshly-cleared ScriptAssemblies).
@@ -53,22 +46,16 @@ namespace MeatKit
 
         private static BuildPlayerExtractAndValidateDelegate _origBPEVST;
 
-        /// <summary>True when the BuildPlayerExtractAndValidateScriptTypes native hook was successfully installed.</summary>
-        internal static bool BPEVSTHookInstalled { get { return _origBPEVST != null; } }
-
         // TransferScriptingObject<GenerateTypeTreeTransfer>: clears the cached SerData (a4+136)
         // before each call during bundle builds so the TypeTree is always regenerated fresh from
         // the live pClass (a4+8) rather than a stale cached TypeTree loaded from Library/metadata.
         // This fixes the Build 2 anvilPrefab regression where the editor-domain startup EATI
         // populates cache+136 from stale metadata, and that stale cache is read by the bundle
-        // type-table writer before ReprimeSilentAfterEATI's clearing takes effect.
+        // type-table writer before the live-pClass re-prime takes effect.
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         private delegate void d_TransferScriptingObjectGTT(long a1, long a2, long a3, long a4);
 
         private static d_TransferScriptingObjectGTT _origTSOGTT;
-
-        /// <summary>True when the TransferScriptingObject&lt;GenerateTypeTreeTransfer&gt; hook is installed.</summary>
-        internal static bool TSOGTTHookInstalled { get { return _origTSOGTT != null; } }
 
         // Schedules a domain reload. Suppressed during MonoScript repair to prevent an infinite
         // reload loop (CheckConsistency → FixRuntimeScriptReference → reload → repeat).
@@ -86,33 +73,20 @@ namespace MeatKit
 
         private static d_IsCompatibleWithEditorCPUAndOS _origIsCompatibleWithEditorCPUAndOS;
 
-        /// <summary>True when the IsCompatibleWithEditorCPUAndOS hook was successfully installed.</summary>
-        internal static bool IsCompatibleHookInstalled { get { return _origIsCompatibleWithEditorCPUAndOS != null; } }
-
         /// <summary>
         /// When true, the Application_RequestScriptReload hook is a no-op.
         /// Set by ManagedPluginDomainFix before ctor-time H3VRCode repair; cleared in delayCall.
         /// </summary>
         internal static volatile bool SuppressRequestScriptReload = false;
 
-        /// <summary>True when the Application_RequestScriptReload suppression hook was successfully installed.</summary>
-        internal static bool RequestScriptReloadHookInstalled { get { return _origRequestScriptReload != null; } }
-
         // Set true by Build.cs _beforeEATI callback during active MeatKit builds.
-        // The AHVTI hook only skips H3VRCode while this is true; cleared by _afterEATI.
+        // The AHVTI hook only skips H3VRCode while this is true; cleared by Build.cs after BuildAssetBundles.
         internal static volatile bool InsideEATI = false;
 
         // True exclusively during a MeatKit bundle build (set by Build.cs _beforeEATI, cleared after
         // BuildAssetBundles). When set, AHVTI blocks ALL Assets/Managed/ DLLs; otherwise (standalone/
         // startup EATI) only H3VRCode is blocked so other plugin DLLs remain available to the compiler.
         internal static volatile bool InsideBundleEATI = false;
-        // True from just before MeatKit.DoBuild() until the build completes. Gates guards that must
-        // not alter results during the build's own serialization.
-        internal static volatile bool BuildInProgress = false;
-        // When true, the AHVTI hook allows ALL assemblies through (no blocking).
-        // Set by ManagedPluginDomainFix during a targeted DLL reimport to let EATI
-        // regenerate the correct TypeTree for H3VRCode without a domain reload.
-        internal static volatile bool BypassAHVTIBlock = false;
 
         // DLL basenames (without extension) from Assets/Managed/ that AHVTI should protect from
         // EATI during bundle builds (InsideBundleEATI=true).  Populated once at static-ctor time
@@ -137,11 +111,6 @@ namespace MeatKit
 
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr hObject);
-
-        // ExitProcess: terminates without running CRT atexit handlers (deadlock site for Mono when
-        // NativeDetour objects have been created). Still fires DLL_PROCESS_DETACH notifications.
-        [DllImport("kernel32.dll")]
-        private static extern void ExitProcess(uint uExitCode);
 
         [DllImport("kernel32.dll")]
         private static extern uint GetCurrentThreadId();
@@ -346,7 +315,7 @@ namespace MeatKit
 
             // NativeDetour objects cause Mono's CRT atexit to deadlock on exit().
             // Hook editorApplicationQuit (fires before exit()) so we have a fallback
-            // (5s watchdog -> ExitProcess) if native shutdown hangs on close.
+            // (5s watchdog -> TerminateProcess) if native shutdown hangs on close.
             RegisterQuitCallback();
 
 
@@ -395,12 +364,6 @@ namespace MeatKit
             IntPtr editorBase = DynDll.OpenLibrary("Unity.exe");
             return Marshal.GetDelegateForFunctionPointer((IntPtr)(editorBase.ToInt64() + from), typeof(T));
         }
-
-        // NOTE: GetCompatibleWithEditorOrAnyPlatform hook not installed.
-        // Its prologue contains RIP-relative instructions that MonoMod copies verbatim to the
-        // trampoline page, causing corrupted memory accesses. The IsCompatibleWithEditorCPUAndOS
-        // hook handles H3VRCode references instead (it calls GetCompatibleWithEditorOrAnyPlatform
-        // internally, so force-returning true for our DLLs achieves the same result).
 
         // NOTE: GetCompatibleWithEditorOrAnyPlatform hook not installed.
         // Its prologue contains RIP-relative instructions that MonoMod copies verbatim to the
@@ -513,10 +476,6 @@ namespace MeatKit
 
             byte result = _origEATI(policyIndex, assemblyId, buildTarget, typeInfoCollector);
 
-            foreach (var cb in AfterEATICallbacks)
-                try { cb(); }
-                catch (Exception ex) { Debug.LogException(ex); }
-
             if (isStandaloneEATI) InsideEATI = wasInsideEATI;
             return result;
         }
@@ -527,9 +486,6 @@ namespace MeatKit
         // Unity string at *a1: *(long*)a1==0 → small-string at a1+8; else heap char*.
         private static byte OnAssemblyHasValidTypeInfo(long a1)
         {
-            if (BypassAHVTIBlock)
-                return _origAHVTI(a1);
-
             if (InsideEATI && a1 != 0)
             {
                 try
