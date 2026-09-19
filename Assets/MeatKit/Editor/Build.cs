@@ -23,10 +23,14 @@ namespace MeatKit
             }
 
             // Refuse to start a build while scripts are still being compiled
-            if (EditorApplication.isCompiling)
+            // or the AssetDatabase is refreshing. Starting (or continuing) a
+            // BuildAssetBundles/EATI window while isCompiling/isUpdating flips
+            // True mid-call corrupts the native TypeDB/mono array and AVs in
+            // KERNELBASE (second-chance c0000005, mini-trampolines.c on stack).
+            if (EditorApplication.isCompiling || EditorApplication.isUpdating)
             {
                 EditorUtility.DisplayDialog("Cannot build",
-                    "Scripts are currently being compiled. Please wait for compilation to finish and then try again.",
+                    "Scripts are currently being compiled or assets are refreshing. Please wait for compilation to finish and then try again.",
                     "Ok");
                 return;
             }
@@ -43,11 +47,15 @@ namespace MeatKit
             {
                 System.Threading.Thread.ResetAbort();
                 NativeHookManager.InsideEATI = false;
+                // InsideBundleEATI must never leak: while set, AHVTI blocks ALL
+                // Assets/Managed/ DLLs, starving the next EATI's mono array.
+                NativeHookManager.InsideBundleEATI = false;
                 BuildLog.SetCompletionStatus(true, "Build interrupted by domain reload.", null);
             }
             catch (MeatKitBuildException e)
             {
                 NativeHookManager.InsideEATI = false;
+                NativeHookManager.InsideBundleEATI = false;
                 string message = e.Message;
                 if (e.InnerException != null) message += "\n\n" + e.InnerException.Message;
                 EditorUtility.DisplayDialog("Build failed", message, "Ok.");
@@ -57,6 +65,7 @@ namespace MeatKit
             catch (Exception e)
             {
                 NativeHookManager.InsideEATI = false;
+                NativeHookManager.InsideBundleEATI = false;
                 EditorUtility.DisplayDialog("Build failed with unknown error",
                     "Error message: " + e.Message + "\n\nCheck console for full exception text.", "Ok.");
                 Debug.LogException(e);
@@ -180,18 +189,39 @@ namespace MeatKit
             NativeHookManager.BeforeEATICallbacks.Add(_beforeEATI);
             NativeHookManager.AfterEATICallbacks.Add(_afterEATI);
 
-            BuildLog.WriteLine("Calling BuildAssetBundles (isCompiling=" + EditorApplication.isCompiling + " InsideEATI=" + NativeHookManager.InsideEATI + ")");
-            var bundleManifest = BuildPipeline.BuildAssetBundles(bundleOutputPath, bundles,
-                BuildAssetBundleOptions.ChunkBasedCompression,
-                BuildTarget.StandaloneWindows64);
-            BuildLog.WriteLine("BuildAssetBundles returned. manifest=" + (bundleManifest != null ? "OK" : "NULL") + " isCompiling=" + EditorApplication.isCompiling);
+            // Batch asset editing around the native BuildAssetBundles/EATI
+            // window. This suppresses async imports/refreshes while the native
+            // TypeDB/mono array is being built: a compile starting mid-call
+            // (isCompiling False->True, seen in buildlog) AVs in KERNELBASE.
+            AssetDatabase.StartAssetEditing();
+            AssetBundleManifest bundleManifest = null;
+            try
+            {
+                if (EditorApplication.isCompiling || EditorApplication.isUpdating)
+                    throw new MeatKitBuildException("Scripts started compiling during build setup. Wait for compilation to finish and retry.");
 
-            // Unregister EATI callbacks
-            NativeHookManager.BeforeEATICallbacks.Remove(_beforeEATI);
-            NativeHookManager.AfterEATICallbacks.Remove(_afterEATI);
-            // Keep InsideEATI=true so post-build EATI can't overwrite H3VRCode TypeTree
-            // Clear InsideBundleEATI so post-build EATI doesn't block BepInEx/OtherLoader
-            NativeHookManager.InsideBundleEATI = false;
+                BuildLog.WriteLine("Calling BuildAssetBundles (isCompiling=" + EditorApplication.isCompiling + " InsideEATI=" + NativeHookManager.InsideEATI + ")");
+                bundleManifest = BuildPipeline.BuildAssetBundles(bundleOutputPath, bundles,
+                    BuildAssetBundleOptions.ChunkBasedCompression,
+                    BuildTarget.StandaloneWindows64);
+                BuildLog.WriteLine("BuildAssetBundles returned. manifest=" + (bundleManifest != null ? "OK" : "NULL") + " isCompiling=" + EditorApplication.isCompiling);
+            }
+            finally
+            {
+                try { AssetDatabase.StopAssetEditing(); } catch { }
+                // Unregister EATI callbacks on every path. Previously this only
+                // ran on success, so an abort/exception leaked the delegate and
+                // the next build ran EnsureH3VRCodeInScriptAssemblies twice.
+                NativeHookManager.BeforeEATICallbacks.Remove(_beforeEATI);
+                NativeHookManager.AfterEATICallbacks.Remove(_afterEATI);
+                // InsideBundleEATI must never leak past the bundle build.
+                // (InsideEATI intentionally keeps its existing success semantics.)
+                NativeHookManager.InsideBundleEATI = false;
+            }
+
+            // NOTE: InsideEATI intentionally keeps its existing success semantics
+            // (stays true so post-build EATI can't overwrite H3VRCode TypeTree).
+            // InsideBundleEATI was already cleared in the finally above.
 
             if (bundleManifest == null)
                 throw new MeatKitBuildException("AssetBundle build failed to produce a manifest. Check the console for errors.");
