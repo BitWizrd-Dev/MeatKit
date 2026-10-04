@@ -84,6 +84,20 @@ namespace MeatKit
         {
             if (ShowErrorIfH3VRNotImported()) return;
 
+            // One-shot: repair H3VRCode MonoScript metadata that was corrupted by
+            // FixRuntimeScriptReference during prior domain-reload cycles. Re-importing
+            // the DLLs forces the MonoImporter to regenerate correct assembly-name refs.
+            // Runs at most once per session, and before any guard, since the forced
+            // reimport queues an AssetDatabase refresh of its own.
+            if (!SessionState.GetBool("MeatKit.RepairedH3VRCodeMS2", false))
+            {
+                string managed = Path.Combine(Application.dataPath, "Managed");
+                foreach (var dll in Directory.GetFiles(managed, "H3VRCode*.dll"))
+                    AssetDatabase.ImportAsset("Assets/Managed/" + Path.GetFileName(dll),
+                        ImportAssetOptions.ForceUpdate | ImportAssetOptions.DontDownloadFromCacheServer);
+                SessionState.SetBool("MeatKit.RepairedH3VRCodeMS2", true);
+            }
+
             BuildProfile profile = BuildWindow.SelectedProfile;
             if (!profile) return;
 
@@ -183,14 +197,12 @@ namespace MeatKit
             NativeHookManager.BeforeEATICallbacks.Add(_beforeEATI);
             NativeHookManager.AfterEATICallbacks.Add(_afterEATI);
 
-            // Suppress async imports during the native build window.
-            AssetDatabase.StartAssetEditing();
+            // NOTE: no StartAssetEditing wrapper here. Proven by gate test:
+            // building bundles while asset editing is active makes Unity refuse
+            // with "Cannot build AssetBundles while imports of assets are in progress".
             AssetBundleManifest bundleManifest = null;
             try
             {
-                if (EditorApplication.isCompiling || EditorApplication.isUpdating)
-                    throw new MeatKitBuildException("Scripts started compiling during build setup. Wait for compilation to finish and retry.");
-
                 BuildLog.WriteLine("Calling BuildAssetBundles (isCompiling=" + EditorApplication.isCompiling + " InsideEATI=" + NativeHookManager.InsideEATI + ")");
                 bundleManifest = BuildPipeline.BuildAssetBundles(bundleOutputPath, bundles,
                     BuildAssetBundleOptions.ChunkBasedCompression,
@@ -199,7 +211,6 @@ namespace MeatKit
             }
             finally
             {
-                try { AssetDatabase.StopAssetEditing(); } catch { }
                 NativeHookManager.BeforeEATICallbacks.Remove(_beforeEATI);
                 NativeHookManager.AfterEATICallbacks.Remove(_afterEATI);
                 NativeHookManager.InsideBundleEATI = false;
