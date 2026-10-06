@@ -516,18 +516,26 @@ namespace MeatKit
                 InsideEATI = true;
             }
 
-            foreach (var cb in BeforeEATICallbacks)
-                try { cb(); }
-                catch (Exception ex) { Debug.LogException(ex); }
+            // Restore in a finally: a throw out of _origEATI would otherwise leave
+            // InsideEATI stuck true for the session, blocking H3VRCode extraction.
+            try
+            {
+                foreach (var cb in BeforeEATICallbacks)
+                    try { cb(); }
+                    catch (Exception ex) { Debug.LogException(ex); }
 
-            byte result = _origEATI(policyIndex, assemblyId, buildTarget, typeInfoCollector);
+                byte result = _origEATI(policyIndex, assemblyId, buildTarget, typeInfoCollector);
 
-            foreach (var cb in AfterEATICallbacks)
-                try { cb(); }
-                catch (Exception ex) { Debug.LogException(ex); }
+                foreach (var cb in AfterEATICallbacks)
+                    try { cb(); }
+                    catch (Exception ex) { Debug.LogException(ex); }
 
-            if (isStandaloneEATI) InsideEATI = wasInsideEATI;
-            return result;
+                return result;
+            }
+            finally
+            {
+                if (isStandaloneEATI) InsideEATI = wasInsideEATI;
+            }
         }
 
         // During bundle builds: return false for ALL Assets/Managed/ DLLs to prevent EATI from
@@ -605,6 +613,9 @@ namespace MeatKit
                 finally
                 {
                     foreach (var detour in Detours) detour.Dispose();
+                    // Clear too: the other shutdown path disposes and clears, so a session
+                    // hitting both would dispose every detour twice.
+                    Detours.Clear();
                 }
             }
         }
