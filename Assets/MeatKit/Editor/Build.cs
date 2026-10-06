@@ -86,6 +86,22 @@ namespace MeatKit
             EditorApplication.UnlockReloadAssemblies();
         }
 
+        // Build output is always x86_64. A mismatched editor target makes Unity run
+        // "Determining assets that need to be reimported for target platform" on
+        // every build, so match the target up front.
+        [InitializeOnLoadMethod]
+        private static void EnsureWindows64TargetOnLoad()
+        {
+            try
+            {
+                if (EditorUserBuildSettings.activeBuildTarget == BuildTarget.StandaloneWindows64) return;
+                EditorUserBuildSettings.SwitchActiveBuildTarget(BuildTargetGroup.Standalone, BuildTarget.StandaloneWindows64);
+            }
+            catch (Exception)
+            {
+            }
+        }
+
         private static void DoBuildInternal()
         {
             if (ShowErrorIfH3VRNotImported()) return;
