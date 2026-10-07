@@ -233,6 +233,18 @@ namespace MeatKit
         private static Assembly ResolveUnityExtensionAssembly(object sender, ResolveEventArgs args)
         {
             var simpleName = new AssemblyName(args.Name).Name;
+            // Prefer an already-loaded copy. LoadAssemblyWrapper does not dedupe against
+            // plugin-loaded assemblies, so a raced bind double-loads the DLL and splits
+            // type identity.
+            foreach (var loaded in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try
+                {
+                    if (string.Equals(loaded.GetName().Name, simpleName, StringComparison.OrdinalIgnoreCase))
+                        return loaded;
+                }
+                catch { }
+            }
             // Search UnityExtensions first (recursive), then Assets/Managed/ (flat).
             string[][] searchPaths = new string[][] {
                 Directory.Exists(_unityExtensionsDir) ? Directory.GetFiles(_unityExtensionsDir, simpleName + ".dll", SearchOption.AllDirectories) : new string[0],
