@@ -140,6 +140,8 @@ namespace MeatKit
                     ImportSingleAssembly(path, destinationDirectory);
             }
 
+            ValidateNoProjectAssemblyReferences(destinationDirectory);
+
             // Check if anything didn't apply
             foreach (var editor in editors)
                 if (!editor.Applied)
@@ -149,6 +151,40 @@ namespace MeatKit
             PlayerSettings.SetScriptingDefineSymbolsForGroup(BuildTargetGroup.Standalone, "H3VR_IMPORTED");
             NormalizeMetaFileGUIDs();
             EnsureMcsRsp();
+        }
+
+        internal static int ValidateNoProjectAssemblyReferences(string managedDirectory)
+        {
+            int problems = 0;
+            foreach (var path in Directory.GetFiles(managedDirectory, "*.dll"))
+            {
+                ModuleDefinition module = null;
+                try
+                {
+                    module = ModuleDefinition.ReadModule(path);
+                    foreach (var reference in module.AssemblyReferences)
+                    {
+                        string n = reference.Name;
+                        if (n == "Assembly-CSharp" || n == "Assembly-CSharp-firstpass" ||
+                            n == "Assembly-CSharp-Editor" || n == "Assembly-CSharp-Editor-firstpass")
+                        {
+                            problems++;
+                            Debug.LogError("[MeatKit] " + Path.GetFileName(path) + " references the project assembly '" + n +
+                                           "'. This creates an assembly reference cycle that Mono cannot unload, which " +
+                                           "duplicates assemblies after script reloads. Remove the reference from the imported DLL.");
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Debug.LogWarning("[MeatKit] Could not inspect " + Path.GetFileName(path) + " for project-assembly references: " + ex.Message);
+                }
+                finally
+                {
+                    if (module != null) module.Dispose();
+                }
+            }
+            return problems;
         }
 
         // Attempts to write the Cecil assembly directly to destPath.  If the destination is
